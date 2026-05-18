@@ -1,7 +1,11 @@
 # Glacier.Graph
 
+[![DEV.to Story](https://img.shields.io/badge/DEV.to-Story-0a0a0a?style=for-the-badge&logo=devto&logoColor=white)](https://dev.to/iancowley/i-built-a-zero-allocation-c-knowledge-graph-because-jvm-graphs-are-too-bloated-4pej)
 [![NuGet Version](https://img.shields.io/nuget/v/Glacier.Graph.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Graph/)
 [![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Graph.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Graph/)
+
+> 📖 **Read the Deep-Dive**: **[I built a zero-allocation C# knowledge graph because JVM graphs are too bloated.](https://dev.to/iancowley/i-built-a-zero-allocation-c-knowledge-graph-because-jvm-graphs-are-too-bloated-4pej)**
+
 
 **Glacier.Graph** is a high-performance, zero-allocation array-backed graph database and traversal engine for .NET 10. Designed for AI agents, semantic reasoning, and ultra-low latency graph operations, it uses a **Forward Star representation** to pack nodes, edges, and relationships in primitive contiguous arrays, completely bypassing Garbage Collector (GC) pressure and maximizing CPU cache hits.
 
