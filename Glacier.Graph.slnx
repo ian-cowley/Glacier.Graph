@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="samples/Glacier.Graph.Demo/Glacier.Graph.Demo.csproj" Id="0fb89bbd-aaa2-45fc-8b7d-44cee6c51eb5" />
+  <Project Path="src/Glacier.Graph/Glacier.Graph.csproj" />
+  <Project Path="src/Glacier.Graph.Host/Glacier.Graph.Host.csproj" />
+</Solution>

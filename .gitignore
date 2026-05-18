@@ -1,0 +1,45 @@
+# Build output folders
+[Bb]in/
+[Oo]bj/
+[Rr]elease/
+
+# IDE and editor folders
+.vs/
+.idea/
+.vscode/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+*.DotSettings
+
+# AI assistant artifacts
+.gemini/
+
+# BenchmarkDotNet artifacts
+BenchmarkDotNet.Artifacts/
+
+# NuGet
+*.nupkg
+packages/
+
+# Database and heavy files (Crucial to block heavy arrays from git)
+*.bin
+graph_database.bin
+temp_graph_database.bin
+
+# Logs
+*.log
+mcp_log.txt
+ncrunch*
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Scratch / working directories
+brain/
+scratch/
