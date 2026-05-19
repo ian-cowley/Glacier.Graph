@@ -24,6 +24,8 @@ namespace Glacier.Graph.Storage
         internal long _columnIndicesStart;
         internal long _edgeRelationsStart;
 
+        private readonly object _lock = new();
+
         // Software page cache to enforce strict memory limit (e.g. 256KB)
         private readonly int _pageSize = 4096;
         private readonly byte[][] _pages;
@@ -118,21 +120,24 @@ namespace Glacier.Graph.Storage
 
         internal int ReadInt32(long offset)
         {
-            var span = GetPage(offset);
-            int inPageOffset = (int)(offset % _pageSize);
-            
-            // Handle integers that cross the 4KB page boundary
-            if (inPageOffset > _pageSize - 4)
+            lock (_lock)
             {
-                Span<byte> temp = stackalloc byte[4];
-                int firstPart = _pageSize - inPageOffset;
-                span.Slice(inPageOffset, firstPart).CopyTo(temp);
-                var span2 = GetPage(offset + firstPart);
-                span2.Slice(0, 4 - firstPart).CopyTo(temp.Slice(firstPart));
-                return MemoryMarshal.Read<int>(temp);
+                var span = GetPage(offset);
+                int inPageOffset = (int)(offset % _pageSize);
+                
+                // Handle integers that cross the 4KB page boundary
+                if (inPageOffset > _pageSize - 4)
+                {
+                    Span<byte> temp = stackalloc byte[4];
+                    int firstPart = _pageSize - inPageOffset;
+                    span.Slice(inPageOffset, firstPart).CopyTo(temp);
+                    var span2 = GetPage(offset + firstPart);
+                    span2.Slice(0, 4 - firstPart).CopyTo(temp.Slice(firstPart));
+                    return MemoryMarshal.Read<int>(temp);
+                }
+                
+                return MemoryMarshal.Read<int>(span.Slice(inPageOffset));
             }
-            
-            return MemoryMarshal.Read<int>(span.Slice(inPageOffset));
         }
 
         public int GetExternalToInternalId(string externalId) => _externalToInternalId.TryGetValue(externalId, out int val) ? val : 0;
