@@ -15,6 +15,7 @@
 
 *   ⚡ **Zero-Allocation Architecture**: Stores all nodes, edges, and relationships inside contiguous primitive arrays (`int[]`). Bypasses the .NET Garbage Collector for high-frequency traversal operations.
 *   🚀 **Forward Star Representation**: An optimized data structure representation for graphs that guarantees sequential memory access and extreme traversal performance.
+*   🗜️ **CSR Out-of-Core Execution**: Compile graphs into a static Compressed Sparse Row (CSR) format with a configurable `maxMemoryBytes` parameter, enabling traversal of massive graphs on embedded/constrained hardware by enforcing a strict software LRU page cache.
 *   🧠 **High-Speed Traversal**: Features built-in, cache-line optimized algorithms for Breadth-First Search (BFS) and hop-distance neighborhood discovery.
 *   💾 **RAM-to-Disk Dumping**: Support for ultra-fast, zero-copy serialization (`GLGR` binary format) to quickly dump and revive huge graphs from disk in milliseconds.
 *   🤖 **MCP Server Support**: Includes a built-in Model Context Protocol (MCP) server interface, making it seamlessly compatible with LLM agents (like Claude or Antigravity) as an active memory reasoning tool.
@@ -78,6 +79,23 @@ store.SaveToDisk("graph_database.bin");
 
 // Instantly restore and revive the graph database on startup
 GraphStore loadedStore = GraphStore.LoadFromDisk("graph_database.bin");
+```
+
+### 5. Out-of-Core Execution (Memory Constrained Environments)
+
+For embedded devices with strictly limited RAM (e.g., 256KB), you can compile the graph into a **Compressed Sparse Row (CSR)** format. This format is heavily optimized for sequential reads from disk/flash storage without relying on unpredictable OS paging.
+
+```csharp
+// Compile the dynamic Forward Star graph into a static CSR binary format
+CsrGraphCompiler.CompileFromForwardStar(store, "graph_database.csr");
+
+// Load the graph with a strict maximum memory limit (e.g., 256 KB)
+// The engine handles LRU page caching internally to prevent out-of-memory errors!
+using var csrStore = new CsrGraphStore("graph_database.csr", maxMemoryBytes: 256 * 1024);
+var csrSearch = new CsrGraphSearch(csrStore);
+
+// Perform traversal perfectly constrained to the 256KB limit
+List<string> path = csrSearch.FindShortestPath("User_1", "User_99999");
 ```
 
 ---

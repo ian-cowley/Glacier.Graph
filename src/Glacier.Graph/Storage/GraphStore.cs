@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -13,19 +13,19 @@ namespace Glacier.Graph.Storage
     public class GraphStore
     {
         // --- Node Maps ---
-        private readonly Dictionary<string, int> _externalToInternalId = new();
-        private readonly Dictionary<int, string> _internalToExternalId = new();
-        private readonly Dictionary<string, int> _relationTypes = new();
+        internal readonly Dictionary<string, int> _externalToInternalId = new();
+        internal readonly Dictionary<int, string> _internalToExternalId = new();
+        internal readonly Dictionary<string, int> _relationTypes = new();
 
-        private string[] _nodeMetadata;
-        private int _nodeCount = 0;
+        internal string[] _nodeMetadata;
+        internal int _nodeCount = 0;
 
         // --- Forward Star Edge Arrays ---
-        private int[] _head;
-        private int[] _to;
-        private int[] _relation;
-        private int[] _next;
-        private int _edgeCount = 0;
+        internal int[] _head;
+        internal int[] _to;
+        internal int[] _relation;
+        internal int[] _next;
+        internal int _edgeCount = 0;
 
         public int NodeCount => _nodeCount;
         public int EdgeCount => _edgeCount;
@@ -194,6 +194,12 @@ namespace Glacier.Graph.Storage
                 return new EdgeEnumerator(internalId, this);
             }
             return new EdgeEnumerator(0, this);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public EdgeEnumerator GetOutwardEdgesByInternalId(int internalId)
+        {
+            return new EdgeEnumerator(internalId, this);
         }
 
         public string GetNodeMetadata(string externalId) =>
