@@ -1,15 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 
 namespace Glacier.Graph.Storage
 {
     /// <summary>
-    /// A Compressed Sparse Row (CSR) graph store that simulates embedded system constraints.
-    /// It enforces a strict memory limit using a software LRU page cache over flash/disk reads.
+    /// A Compressed Sparse Row (CSR) graph store supporting high-throughput direct Memory-Mapped File (MMF)
+    /// pointer traversal for instant zero-lock graph queries, alongside an optional software page cache for constrained simulation.
     /// </summary>
-    public class CsrGraphStore : IDisposable
+    public unsafe class CsrGraphStore : IDisposable
     {
         private readonly Dictionary<string, int> _externalToInternalId = new();
         private readonly Dictionary<int, string> _internalToExternalId = new();
@@ -20,20 +21,24 @@ namespace Glacier.Graph.Storage
         public int EdgeCount { get; private set; }
 
         private FileStream _fs;
+        private MemoryMappedFile? _mmf;
+        private MemoryMappedViewAccessor? _accessor;
+        private byte* _basePointer;
+
         internal long _rowOffsetsStart;
         internal long _columnIndicesStart;
         internal long _edgeRelationsStart;
 
         private readonly object _lock = new();
 
-        // Software page cache to enforce strict memory limit (e.g. 256KB)
+        // Software page cache to enforce strict memory limit (e.g. 256KB) when MMF is disabled
         private readonly int _pageSize = 4096;
         private readonly byte[][] _pages;
         private readonly long[] _pageTags;
         private readonly int[] _pageAccess; 
         private int _accessCounter = 0;
 
-        public CsrGraphStore(string filePath, int maxMemoryBytes = 256 * 1024)
+        public CsrGraphStore(string filePath, int maxMemoryBytes = 256 * 1024, bool useMemoryMapping = true)
         {
             _fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.RandomAccess);
             using var reader = new BinaryReader(_fs, System.Text.Encoding.UTF8, leaveOpen: true);
@@ -67,7 +72,21 @@ namespace Glacier.Graph.Storage
             _columnIndicesStart = _rowOffsetsStart + (NodeCount + 2) * sizeof(int);
             _edgeRelationsStart = _columnIndicesStart + EdgeCount * sizeof(int);
 
-            // Initialize Page Cache
+            if (useMemoryMapping)
+            {
+                try
+                {
+                    _mmf = MemoryMappedFile.CreateFromFile(_fs, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: true);
+                    _accessor = _mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+                    _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref _basePointer);
+                }
+                catch
+                {
+                    _basePointer = null;
+                }
+            }
+
+            // Initialize Page Cache (used when memory mapping is disabled)
             int numPages = Math.Max(1, maxMemoryBytes / _pageSize);
             _pages = new byte[numPages][];
             for (int i = 0; i < numPages; i++) _pages[i] = new byte[_pageSize];
@@ -120,6 +139,11 @@ namespace Glacier.Graph.Storage
 
         internal int ReadInt32(long offset)
         {
+            if (_basePointer != null && offset >= 0 && offset + 4 <= _fs.Length)
+            {
+                return *(int*)(_basePointer + offset);
+            }
+
             lock (_lock)
             {
                 var span = GetPage(offset);
@@ -145,34 +169,66 @@ namespace Glacier.Graph.Storage
 
         public CsrEdgeEnumerator GetOutwardEdgesByInternalId(int internalId)
         {
+            if (_basePointer != null)
+            {
+                int* pRowOffsets = (int*)(_basePointer + _rowOffsetsStart);
+                int startIdx = pRowOffsets[internalId];
+                int endIdx = pRowOffsets[internalId + 1];
+                return new CsrEdgeEnumerator(this, startIdx, endIdx);
+            }
+
             long rowOffsetPos = _rowOffsetsStart + internalId * sizeof(int);
-            int startIdx = ReadInt32(rowOffsetPos);
-            int endIdx = ReadInt32(rowOffsetPos + sizeof(int));
-            return new CsrEdgeEnumerator(this, startIdx, endIdx);
+            int s = ReadInt32(rowOffsetPos);
+            int e = ReadInt32(rowOffsetPos + sizeof(int));
+            return new CsrEdgeEnumerator(this, s, e);
         }
 
         public void Dispose()
         {
+            if (_basePointer != null)
+            {
+                _accessor?.SafeMemoryMappedViewHandle.ReleasePointer();
+                _basePointer = null;
+            }
+            _accessor?.Dispose();
+            _mmf?.Dispose();
             _fs?.Dispose();
         }
 
-        public struct CsrEdgeEnumerator
+        public unsafe struct CsrEdgeEnumerator
         {
             private readonly CsrGraphStore _store;
             private int _currentIndex;
             private readonly int _endIndex;
+            private readonly int* _pColumns;
+            private readonly int* _pRelations;
 
             public CsrEdgeEnumerator(CsrGraphStore store, int startIndex, int endIndex)
             {
                 _store = store;
                 _currentIndex = startIndex;
                 _endIndex = endIndex;
+                if (store._basePointer != null)
+                {
+                    _pColumns = (int*)(store._basePointer + store._columnIndicesStart);
+                    _pRelations = (int*)(store._basePointer + store._edgeRelationsStart);
+                }
+                else
+                {
+                    _pColumns = null;
+                    _pRelations = null;
+                }
             }
 
             public bool MoveNext() => _currentIndex < _endIndex;
 
-            public int CurrentTargetNodeId => _store.ReadInt32(_store._columnIndicesStart + _currentIndex * sizeof(int));
-            public int CurrentRelationId => _store.ReadInt32(_store._edgeRelationsStart + _currentIndex * sizeof(int));
+            public int CurrentTargetNodeId => _pColumns != null
+                ? _pColumns[_currentIndex]
+                : _store.ReadInt32(_store._columnIndicesStart + _currentIndex * sizeof(int));
+
+            public int CurrentRelationId => _pRelations != null
+                ? _pRelations[_currentIndex]
+                : _store.ReadInt32(_store._edgeRelationsStart + _currentIndex * sizeof(int));
 
             public void Advance()
             {
