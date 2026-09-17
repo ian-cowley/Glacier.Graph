@@ -1,3 +1,5 @@
+![Glacier.Graph Banner](assets/banner.jpg)
+
 # Glacier.Graph
 
 [![DEV.to Story](https://img.shields.io/badge/DEV.to-Story-0a0a0a?style=for-the-badge&logo=devto&logoColor=white)](https://dev.to/iancowley/i-built-a-zero-allocation-c-knowledge-graph-because-jvm-graphs-are-too-bloated-4pej)
