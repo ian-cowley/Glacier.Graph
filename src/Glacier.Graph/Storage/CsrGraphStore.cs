@@ -165,7 +165,7 @@ namespace Glacier.Graph.Storage
         }
 
         public int GetExternalToInternalId(string externalId) => _externalToInternalId.TryGetValue(externalId, out int val) ? val : 0;
-        public string GetExternalId(int internalId) => _internalToExternalId.TryGetValue(internalId, out string val) ? val : string.Empty;
+        public string GetExternalId(int internalId) => _internalToExternalId.TryGetValue(internalId, out string? val) && val != null ? val : string.Empty;
 
         public CsrEdgeEnumerator GetOutwardEdgesByInternalId(int internalId)
         {

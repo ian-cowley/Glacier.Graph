@@ -16,6 +16,7 @@ namespace Glacier.Graph.Storage
         internal readonly Dictionary<string, int> _externalToInternalId = new();
         internal readonly Dictionary<int, string> _internalToExternalId = new();
         internal readonly Dictionary<string, int> _relationTypes = new();
+        internal readonly Dictionary<int, string> _relationTypeNames = new();
 
         internal string[] _nodeMetadata;
         internal int _nodeCount = 0;
@@ -25,10 +26,30 @@ namespace Glacier.Graph.Storage
         internal int[] _to;
         internal int[] _relation;
         internal int[] _next;
+        internal float[] _weights;
         internal int _edgeCount = 0;
 
-        public int NodeCount => _nodeCount;
-        public int EdgeCount => _edgeCount;
+        private readonly ReaderWriterLockSlim _rwLock = new(LockRecursionPolicy.SupportsRecursion);
+
+        public int NodeCount
+        {
+            get
+            {
+                _rwLock.EnterReadLock();
+                try { return _nodeCount; }
+                finally { _rwLock.ExitReadLock(); }
+            }
+        }
+
+        public int EdgeCount
+        {
+            get
+            {
+                _rwLock.EnterReadLock();
+                try { return _edgeCount; }
+                finally { _rwLock.ExitReadLock(); }
+            }
+        }
 
         public GraphStore(int initialNodeCapacity = 100_000, int initialEdgeCapacity = 500_000)
         {
@@ -37,50 +58,61 @@ namespace Glacier.Graph.Storage
             _to = new int[initialEdgeCapacity + 1];
             _relation = new int[initialEdgeCapacity + 1];
             _next = new int[initialEdgeCapacity + 1];
+            _weights = new float[initialEdgeCapacity + 1];
+            Array.Fill(_weights, 1.0f);
         }
 
         // --- PERSISTENCE (RAM-to-Disk dumping) ---
 
         public void SaveToDisk(string filePath)
         {
-            using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 65536);
-            using var writer = new BinaryWriter(fs);
-
-            // 1. Header (Magic Bytes + Version + Capacities)
-            writer.Write("GLGR");
-            writer.Write(1);
-            writer.Write(_nodeCount);
-            writer.Write(_edgeCount);
-            writer.Write(_head.Length);
-            writer.Write(_to.Length);
-
-            // 2. Relation Types Dict
-            writer.Write(_relationTypes.Count);
-            foreach (var kvp in _relationTypes)
+            _rwLock.EnterReadLock();
+            try
             {
-                writer.Write(kvp.Key);
-                writer.Write(kvp.Value);
-            }
+                using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 65536);
+                using var writer = new BinaryWriter(fs);
 
-            // 3. Node ID Mappings
-            writer.Write(_externalToInternalId.Count);
-            foreach (var kvp in _externalToInternalId)
+                // 1. Header (Magic Bytes + Version + Capacities)
+                writer.Write("GLGR");
+                writer.Write(2); // Version 2 includes weights
+                writer.Write(_nodeCount);
+                writer.Write(_edgeCount);
+                writer.Write(_head.Length);
+                writer.Write(_to.Length);
+
+                // 2. Relation Types Dict
+                writer.Write(_relationTypes.Count);
+                foreach (var kvp in _relationTypes)
+                {
+                    writer.Write(kvp.Key);
+                    writer.Write(kvp.Value);
+                }
+
+                // 3. Node ID Mappings
+                writer.Write(_externalToInternalId.Count);
+                foreach (var kvp in _externalToInternalId)
+                {
+                    writer.Write(kvp.Key);
+                    writer.Write(kvp.Value);
+                }
+
+                // 4. String Metadata Array
+                for (int i = 0; i < _head.Length; i++)
+                {
+                    writer.Write(_nodeMetadata[i] ?? string.Empty);
+                }
+
+                // 5. Raw Array Byte Dumps (The fast part)
+                fs.Write(MemoryMarshal.AsBytes(_head.AsSpan()));
+                fs.Write(MemoryMarshal.AsBytes(_to.AsSpan()));
+                fs.Write(MemoryMarshal.AsBytes(_relation.AsSpan()));
+                fs.Write(MemoryMarshal.AsBytes(_next.AsSpan()));
+                fs.Write(MemoryMarshal.AsBytes(_weights.AsSpan()));
+            }
+            finally
             {
-                writer.Write(kvp.Key);
-                writer.Write(kvp.Value);
+                _rwLock.ExitReadLock();
             }
-
-            // 4. String Metadata Array
-            for (int i = 0; i < _head.Length; i++)
-            {
-                writer.Write(_nodeMetadata[i] ?? string.Empty);
-            }
-
-            // 5. Raw Array Byte Dumps (The fast part)
-            fs.Write(MemoryMarshal.AsBytes(_head.AsSpan()));
-            fs.Write(MemoryMarshal.AsBytes(_to.AsSpan()));
-            fs.Write(MemoryMarshal.AsBytes(_relation.AsSpan()));
-            fs.Write(MemoryMarshal.AsBytes(_next.AsSpan()));
         }
 
         public static GraphStore LoadFromDisk(string filePath)
@@ -90,7 +122,7 @@ namespace Glacier.Graph.Storage
 
             // 1. Header
             if (reader.ReadString() != "GLGR") throw new Exception("Invalid Glacier Graph file format.");
-            int version = reader.ReadInt32(); // Reserved for future schema updates
+            int version = reader.ReadInt32(); // Reserved for schema updates
 
             int nodeCount = reader.ReadInt32();
             int edgeCount = reader.ReadInt32();
@@ -105,7 +137,10 @@ namespace Glacier.Graph.Storage
             int relCount = reader.ReadInt32();
             for (int i = 0; i < relCount; i++)
             {
-                store._relationTypes[reader.ReadString()] = reader.ReadInt32();
+                string rName = reader.ReadString();
+                int rId = reader.ReadInt32();
+                store._relationTypes[rName] = rId;
+                store._relationTypeNames[rId] = rName;
             }
 
             // 3. Node ID Mappings
@@ -130,70 +165,123 @@ namespace Glacier.Graph.Storage
             fs.ReadExactly(MemoryMarshal.AsBytes(store._relation.AsSpan()));
             fs.ReadExactly(MemoryMarshal.AsBytes(store._next.AsSpan()));
 
+            if (version >= 2)
+            {
+                fs.ReadExactly(MemoryMarshal.AsBytes(store._weights.AsSpan()));
+            }
+            else
+            {
+                Array.Fill(store._weights, 1.0f);
+            }
+
             return store;
         }
 
         // --- GRAPH LOGIC ---
 
-        public int AddNode(string externalId, string metadata = "")
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryGetInternalId(string externalId, out int internalId)
         {
-            if (_externalToInternalId.TryGetValue(externalId, out int existingId))
+            _rwLock.EnterReadLock();
+            try
             {
-                _nodeMetadata[existingId] = metadata;
-                return existingId;
+                return _externalToInternalId.TryGetValue(externalId, out internalId);
             }
-
-            int newId = ++_nodeCount;
-
-            if (newId >= _head.Length)
+            finally
             {
-                int newSize = _head.Length * 2;
-                Array.Resize(ref _head, newSize);
-                Array.Resize(ref _nodeMetadata, newSize);
+                _rwLock.ExitReadLock();
             }
-
-            _externalToInternalId[externalId] = newId;
-            _internalToExternalId[newId] = externalId;
-            _nodeMetadata[newId] = metadata;
-
-            return newId;
         }
 
-        public void AddEdge(string sourceId, string targetId, string relationType)
+        public int AddNode(string externalId, string metadata = "")
         {
-            int source = AddNode(sourceId);
-            int target = AddNode(targetId);
-
-            if (!_relationTypes.TryGetValue(relationType, out int relId))
+            _rwLock.EnterWriteLock();
+            try
             {
-                relId = _relationTypes.Count + 1;
-                _relationTypes[relationType] = relId;
+                if (_externalToInternalId.TryGetValue(externalId, out int existingId))
+                {
+                    if (!string.IsNullOrEmpty(metadata))
+                    {
+                        _nodeMetadata[existingId] = metadata;
+                    }
+                    return existingId;
+                }
+
+                int newId = ++_nodeCount;
+
+                if (newId >= _head.Length)
+                {
+                    int newSize = _head.Length * 2;
+                    Array.Resize(ref _head, newSize);
+                    Array.Resize(ref _nodeMetadata, newSize);
+                }
+
+                _externalToInternalId[externalId] = newId;
+                _internalToExternalId[newId] = externalId;
+                _nodeMetadata[newId] = metadata;
+
+                return newId;
             }
-
-            int edgeIndex = ++_edgeCount;
-
-            if (edgeIndex >= _to.Length)
+            finally
             {
-                int newSize = _to.Length * 2;
-                Array.Resize(ref _to, newSize);
-                Array.Resize(ref _relation, newSize);
-                Array.Resize(ref _next, newSize);
+                _rwLock.ExitWriteLock();
             }
+        }
 
-            _to[edgeIndex] = target;
-            _relation[edgeIndex] = relId;
-            _next[edgeIndex] = _head[source];
-            _head[source] = edgeIndex;
+        public void AddEdge(string sourceId, string targetId, string relationType, float weight = 1.0f)
+        {
+            _rwLock.EnterWriteLock();
+            try
+            {
+                int source = AddNode(sourceId);
+                int target = AddNode(targetId);
+
+                if (!_relationTypes.TryGetValue(relationType, out int relId))
+                {
+                    relId = _relationTypes.Count + 1;
+                    _relationTypes[relationType] = relId;
+                    _relationTypeNames[relId] = relationType;
+                }
+
+                int edgeIndex = ++_edgeCount;
+
+                if (edgeIndex >= _to.Length)
+                {
+                    int newSize = _to.Length * 2;
+                    Array.Resize(ref _to, newSize);
+                    Array.Resize(ref _relation, newSize);
+                    Array.Resize(ref _next, newSize);
+                    Array.Resize(ref _weights, newSize);
+                }
+
+                _to[edgeIndex] = target;
+                _relation[edgeIndex] = relId;
+                _weights[edgeIndex] = weight;
+                _next[edgeIndex] = _head[source];
+                _head[source] = edgeIndex;
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public EdgeEnumerator GetOutwardEdges(string sourceId)
         {
-            if (_externalToInternalId.TryGetValue(sourceId, out int internalId))
+            _rwLock.EnterReadLock();
+            try
             {
-                return new EdgeEnumerator(internalId, this);
+                if (_externalToInternalId.TryGetValue(sourceId, out int internalId))
+                {
+                    return new EdgeEnumerator(internalId, this);
+                }
+                return new EdgeEnumerator(0, this);
             }
-            return new EdgeEnumerator(0, this);
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -202,11 +290,78 @@ namespace Glacier.Graph.Storage
             return new EdgeEnumerator(internalId, this);
         }
 
-        public string GetNodeMetadata(string externalId) =>
-            _externalToInternalId.TryGetValue(externalId, out int id) ? _nodeMetadata[id] : string.Empty;
+        public string GetNodeMetadata(string externalId)
+        {
+            _rwLock.EnterReadLock();
+            try
+            {
+                return _externalToInternalId.TryGetValue(externalId, out int id) ? _nodeMetadata[id] : string.Empty;
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
 
-        public string GetExternalId(int internalId) =>
-            _internalToExternalId.TryGetValue(internalId, out string id) ? id : string.Empty;
+        public string GetExternalId(int internalId)
+        {
+            _rwLock.EnterReadLock();
+            try
+            {
+                return _internalToExternalId.TryGetValue(internalId, out string? id) && id != null ? id : string.Empty;
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
+
+        public string GetRelationType(int relationId)
+        {
+            _rwLock.EnterReadLock();
+            try
+            {
+                return _relationTypeNames.TryGetValue(relationId, out string? name) ? name : string.Empty;
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
+
+        public int GetNodeDegree(int internalId)
+        {
+            _rwLock.EnterReadLock();
+            try
+            {
+                if (internalId <= 0 || internalId > _nodeCount) return 0;
+                int degree = 0;
+                int edgeIndex = _head[internalId];
+                while (edgeIndex != 0)
+                {
+                    degree++;
+                    edgeIndex = _next[edgeIndex];
+                }
+                return degree;
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
+
+        public int GetNodeDegree(string externalId)
+        {
+            _rwLock.EnterReadLock();
+            try
+            {
+                return _externalToInternalId.TryGetValue(externalId, out int id) ? GetNodeDegree(id) : 0;
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
 
         public struct EdgeEnumerator
         {
@@ -216,13 +371,14 @@ namespace Glacier.Graph.Storage
             public EdgeEnumerator(int sourceNodeId, GraphStore store)
             {
                 _store = store;
-                _currentEdgeIndex = sourceNodeId > 0 ? store._head[sourceNodeId] : 0;
+                _currentEdgeIndex = sourceNodeId > 0 && sourceNodeId <= store._nodeCount ? store._head[sourceNodeId] : 0;
             }
 
             public bool MoveNext() => _currentEdgeIndex != 0;
 
             public int CurrentTargetNodeId => _store._to[_currentEdgeIndex];
             public int CurrentRelationId => _store._relation[_currentEdgeIndex];
+            public float CurrentWeight => _store._weights[_currentEdgeIndex];
 
             public void Advance()
             {
