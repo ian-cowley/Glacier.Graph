@@ -171,6 +171,12 @@ Add the following entry to your `mcp_config.json` (usually located in your agent
 
 We welcome community contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for local setups, branch models, and PR checklist details.
 
+## 🆕 What's New in v1.0.4
+
+- **CSR Forward Star storage** — pure array-backed graph representation with zero GC allocations per traversal operation.
+- **Parallel BFS/DFS and Dijkstra shortest-path** — multi-threaded traversal exploiting all available CPU cores.
+- **Full test suite authored from scratch** — **14 tests** covering traversal correctness, serialization, and MCP integration.
+
 ## Credits
 
 Developed by **Ian Cowley** and **Antigravity (Google DeepMind)**.
