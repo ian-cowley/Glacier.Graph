@@ -3,4 +3,5 @@
   <Project Path="src/Glacier.Graph/Glacier.Graph.csproj" />
   <Project Path="src/Glacier.Graph.Host/Glacier.Graph.Host.csproj" />
   <Project Path="tests/Glacier.Graph.Tests/Glacier.Graph.Tests.csproj" />
+  <Project Path="benchmarks/Glacier.Graph.Benchmarks/Glacier.Graph.Benchmarks.csproj" />
 </Solution>

@@ -6,7 +6,8 @@ using Glacier.Graph.Storage;
 
 /// <summary>
 /// High-performance traversal algorithms for Glacier.Graph.
-/// Uses flat arrays for tracking visited state to guarantee maximum CPU cache hits.
+/// Uses pooled scratch arrays and O(1) generation tagging (<see cref="TraversalScratchWorkspace"/>)
+/// to achieve zero GC heap allocations during traversals.
 /// Guarantees pure read-only queries with zero mutations.
 /// </summary>
 public class GraphSearch
@@ -20,7 +21,91 @@ public class GraphSearch
 
     /// <summary>
     /// Finds the shortest unweighted path between two nodes using Breadth-First Search (BFS).
+    /// Writes the sequence of internal node IDs making up the path into <paramref name="pathBuffer"/>.
+    /// Returns the number of nodes in the path, or 0 if no path exists or the buffer is too small.
+    /// Pure zero-allocation query path.
+    /// </summary>
+    public int FindShortestPath(int startInternalId, int targetInternalId, Span<int> pathBuffer, TraversalScratchWorkspace? workspace = null)
+    {
+        int nodeCount = _store.NodeCount;
+        if (startInternalId <= 0 || targetInternalId <= 0 || startInternalId > nodeCount || targetInternalId > nodeCount)
+        {
+            return 0;
+        }
+
+        if (startInternalId == targetInternalId)
+        {
+            if (pathBuffer.Length > 0)
+            {
+                pathBuffer[0] = startInternalId;
+                return 1;
+            }
+            return 0;
+        }
+
+        var ws = workspace ?? TraversalScratchWorkspace.GetThreadStatic(nodeCount + 1);
+        ws.NextGeneration(nodeCount + 1);
+        ws.ResetQueue();
+
+        ws.Parent[startInternalId] = 0;
+        ws.SetVisited(startInternalId);
+        ws.Enqueue(startInternalId);
+
+        bool found = false;
+
+        while (ws.HasQueueItems)
+        {
+            int current = ws.Dequeue();
+
+            if (current == targetInternalId)
+            {
+                found = true;
+                break;
+            }
+
+            var edges = new GraphStore.EdgeEnumerator(current, _store);
+            while (edges.MoveNext())
+            {
+                int neighbor = edges.CurrentTargetNodeId;
+                if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                {
+                    ws.SetVisited(neighbor);
+                    ws.Parent[neighbor] = current;
+                    ws.Enqueue(neighbor);
+                }
+                edges.Advance();
+            }
+        }
+
+        if (!found) return 0;
+
+        // Calculate path length
+        int length = 0;
+        int curr = targetInternalId;
+        while (curr != 0)
+        {
+            length++;
+            if (curr == startInternalId) break;
+            curr = ws.Parent[curr];
+        }
+
+        if (pathBuffer.Length < length) return 0;
+
+        // Reconstruct path in forward order
+        curr = targetInternalId;
+        for (int i = length - 1; i >= 0; i--)
+        {
+            pathBuffer[i] = curr;
+            curr = ws.Parent[curr];
+        }
+
+        return length;
+    }
+
+    /// <summary>
+    /// Finds the shortest unweighted path between two nodes using Breadth-First Search (BFS).
     /// Returns the sequence of node IDs making up the path, or an empty list if no path exists.
+    /// Eliminates intermediate traversal heap allocations via pooled scratch buffers.
     /// Pure read-only query: does NOT mutate graph state.
     /// </summary>
     public List<string> FindShortestPath(string startId, string targetId)
@@ -34,18 +119,19 @@ public class GraphSearch
         if (startInternal == targetInternal) return new List<string> { startId };
 
         int nodeCount = _store.NodeCount;
-        bool[] visited = new bool[nodeCount + 1];
-        int[] parent = new int[nodeCount + 1];
+        var ws = TraversalScratchWorkspace.GetThreadStatic(nodeCount + 1);
+        ws.NextGeneration(nodeCount + 1);
+        ws.ResetQueue();
 
-        Queue<int> queue = new Queue<int>();
-        queue.Enqueue(startInternal);
-        visited[startInternal] = true;
+        ws.Parent[startInternal] = 0;
+        ws.SetVisited(startInternal);
+        ws.Enqueue(startInternal);
 
         bool found = false;
 
-        while (queue.Count > 0)
+        while (ws.HasQueueItems)
         {
-            int current = queue.Dequeue();
+            int current = ws.Dequeue();
 
             if (current == targetInternal)
             {
@@ -57,34 +143,126 @@ public class GraphSearch
             while (edges.MoveNext())
             {
                 int neighbor = edges.CurrentTargetNodeId;
-                if (neighbor <= nodeCount && !visited[neighbor])
+                if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
                 {
-                    visited[neighbor] = true;
-                    parent[neighbor] = current;
-                    queue.Enqueue(neighbor);
+                    ws.SetVisited(neighbor);
+                    ws.Parent[neighbor] = current;
+                    ws.Enqueue(neighbor);
                 }
                 edges.Advance();
             }
         }
 
-        var path = new List<string>();
-        if (found)
+        if (!found) return new List<string>();
+
+        // Reconstruct path
+        int length = 0;
+        int curr = targetInternal;
+        while (curr != 0)
         {
-            int curr = targetInternal;
-            while (curr != 0)
-            {
-                path.Add(_store.GetExternalId(curr));
-                curr = parent[curr];
-            }
-            path.Reverse();
+            length++;
+            if (curr == startInternal) break;
+            curr = ws.Parent[curr];
         }
+
+        var path = new List<string>(length);
+        curr = targetInternal;
+        while (curr != 0)
+        {
+            path.Add(_store.GetExternalId(curr));
+            if (curr == startInternal) break;
+            curr = ws.Parent[curr];
+        }
+        path.Reverse();
 
         return path;
     }
 
     /// <summary>
     /// Finds a path between two nodes using Depth-First Search (DFS).
+    /// Writes the sequence of internal node IDs making up the path into <paramref name="pathBuffer"/>.
+    /// Returns the number of nodes in the path, or 0 if no path exists or the buffer is too small.
+    /// Pure zero-allocation query path.
+    /// </summary>
+    public int FindPathDfs(int startInternalId, int targetInternalId, Span<int> pathBuffer, TraversalScratchWorkspace? workspace = null)
+    {
+        int nodeCount = _store.NodeCount;
+        if (startInternalId <= 0 || targetInternalId <= 0 || startInternalId > nodeCount || targetInternalId > nodeCount)
+        {
+            return 0;
+        }
+
+        if (startInternalId == targetInternalId)
+        {
+            if (pathBuffer.Length > 0)
+            {
+                pathBuffer[0] = startInternalId;
+                return 1;
+            }
+            return 0;
+        }
+
+        var ws = workspace ?? TraversalScratchWorkspace.GetThreadStatic(nodeCount + 1);
+        ws.NextGeneration(nodeCount + 1);
+        ws.ResetStack();
+
+        ws.Parent[startInternalId] = 0;
+        ws.SetVisited(startInternalId);
+        ws.PushStack(startInternalId);
+
+        bool found = false;
+
+        while (ws.HasStackItems)
+        {
+            int current = ws.PopStack();
+
+            if (current == targetInternalId)
+            {
+                found = true;
+                break;
+            }
+
+            var edges = new GraphStore.EdgeEnumerator(current, _store);
+            while (edges.MoveNext())
+            {
+                int neighbor = edges.CurrentTargetNodeId;
+                if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                {
+                    ws.SetVisited(neighbor);
+                    ws.Parent[neighbor] = current;
+                    ws.PushStack(neighbor);
+                }
+                edges.Advance();
+            }
+        }
+
+        if (!found) return 0;
+
+        int length = 0;
+        int curr = targetInternalId;
+        while (curr != 0)
+        {
+            length++;
+            if (curr == startInternalId) break;
+            curr = ws.Parent[curr];
+        }
+
+        if (pathBuffer.Length < length) return 0;
+
+        curr = targetInternalId;
+        for (int i = length - 1; i >= 0; i--)
+        {
+            pathBuffer[i] = curr;
+            curr = ws.Parent[curr];
+        }
+
+        return length;
+    }
+
+    /// <summary>
+    /// Finds a path between two nodes using Depth-First Search (DFS).
     /// Pure read-only query: does NOT mutate graph state.
+    /// Eliminates intermediate traversal heap allocations via pooled scratch buffers.
     /// </summary>
     public List<string> FindPathDfs(string startId, string targetId)
     {
@@ -97,18 +275,19 @@ public class GraphSearch
         if (startInternal == targetInternal) return new List<string> { startId };
 
         int nodeCount = _store.NodeCount;
-        bool[] visited = new bool[nodeCount + 1];
-        int[] parent = new int[nodeCount + 1];
+        var ws = TraversalScratchWorkspace.GetThreadStatic(nodeCount + 1);
+        ws.NextGeneration(nodeCount + 1);
+        ws.ResetStack();
 
-        var stack = new Stack<int>();
-        stack.Push(startInternal);
-        visited[startInternal] = true;
+        ws.Parent[startInternal] = 0;
+        ws.SetVisited(startInternal);
+        ws.PushStack(startInternal);
 
         bool found = false;
 
-        while (stack.Count > 0)
+        while (ws.HasStackItems)
         {
-            int current = stack.Pop();
+            int current = ws.PopStack();
 
             if (current == targetInternal)
             {
@@ -120,34 +299,133 @@ public class GraphSearch
             while (edges.MoveNext())
             {
                 int neighbor = edges.CurrentTargetNodeId;
-                if (neighbor <= nodeCount && !visited[neighbor])
+                if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
                 {
-                    visited[neighbor] = true;
-                    parent[neighbor] = current;
-                    stack.Push(neighbor);
+                    ws.SetVisited(neighbor);
+                    ws.Parent[neighbor] = current;
+                    ws.PushStack(neighbor);
                 }
                 edges.Advance();
             }
         }
 
-        var path = new List<string>();
-        if (found)
+        if (!found) return new List<string>();
+
+        int length = 0;
+        int curr = targetInternal;
+        while (curr != 0)
         {
-            int curr = targetInternal;
-            while (curr != 0)
-            {
-                path.Add(_store.GetExternalId(curr));
-                curr = parent[curr];
-            }
-            path.Reverse();
+            length++;
+            if (curr == startInternal) break;
+            curr = ws.Parent[curr];
         }
+
+        var path = new List<string>(length);
+        curr = targetInternal;
+        while (curr != 0)
+        {
+            path.Add(_store.GetExternalId(curr));
+            if (curr == startInternal) break;
+            curr = ws.Parent[curr];
+        }
+        path.Reverse();
 
         return path;
     }
 
     /// <summary>
     /// Finds the weighted shortest path between two nodes using Dijkstra's algorithm.
-    /// Uses positive edge weights and a PriorityQueue min-heap.
+    /// Writes the sequence of internal node IDs making up the path into <paramref name="pathBuffer"/>.
+    /// Returns the number of nodes in the path, or 0 if no path exists or the buffer is too small.
+    /// Pure zero-allocation query path using pooled min-heap and generation-tagged distance arrays.
+    /// </summary>
+    public int FindShortestPathDijkstra(int startInternalId, int targetInternalId, Span<int> pathBuffer, TraversalScratchWorkspace? workspace = null)
+    {
+        int nodeCount = _store.NodeCount;
+        if (startInternalId <= 0 || targetInternalId <= 0 || startInternalId > nodeCount || targetInternalId > nodeCount)
+        {
+            return 0;
+        }
+
+        if (startInternalId == targetInternalId)
+        {
+            if (pathBuffer.Length > 0)
+            {
+                pathBuffer[0] = startInternalId;
+                return 1;
+            }
+            return 0;
+        }
+
+        var ws = workspace ?? TraversalScratchWorkspace.GetThreadStatic(nodeCount + 1);
+        ws.NextGeneration(nodeCount + 1);
+        ws.ResetHeap();
+
+        ws.Parent[startInternalId] = 0;
+        ws.Distances[startInternalId] = 0f;
+        ws.SetVisited(startInternalId);
+        ws.EnqueueHeap(startInternalId, 0f);
+
+        bool found = false;
+
+        while (ws.TryDequeueHeap(out int current, out float curDist))
+        {
+            if (curDist > ws.Distances[current]) continue;
+
+            if (current == targetInternalId)
+            {
+                found = true;
+                break;
+            }
+
+            var edges = new GraphStore.EdgeEnumerator(current, _store);
+            while (edges.MoveNext())
+            {
+                int neighbor = edges.CurrentTargetNodeId;
+                float weight = edges.CurrentWeight > 0f ? edges.CurrentWeight : 1.0f;
+                float newDist = curDist + weight;
+
+                if (neighbor <= nodeCount)
+                {
+                    if (!ws.IsVisited(neighbor) || newDist < ws.Distances[neighbor])
+                    {
+                        ws.SetVisited(neighbor);
+                        ws.Distances[neighbor] = newDist;
+                        ws.Parent[neighbor] = current;
+                        ws.EnqueueHeap(neighbor, newDist);
+                    }
+                }
+                edges.Advance();
+            }
+        }
+
+        if (!found) return 0;
+
+        int length = 0;
+        int curr = targetInternalId;
+        while (curr != 0)
+        {
+            length++;
+            if (curr == startInternalId) break;
+            curr = ws.Parent[curr];
+        }
+
+        if (pathBuffer.Length < length) return 0;
+
+        curr = targetInternalId;
+        for (int i = length - 1; i >= 0; i--)
+        {
+            pathBuffer[i] = curr;
+            curr = ws.Parent[curr];
+        }
+
+        return length;
+    }
+
+    /// <summary>
+    /// Finds the weighted shortest path between two nodes using Dijkstra's algorithm.
+    /// Uses positive edge weights and a pooled min-heap.
+    /// Eliminates intermediate traversal heap allocations via pooled scratch buffers.
     /// Pure read-only query: does NOT mutate graph state.
     /// </summary>
     public List<string> FindShortestPathDijkstra(string startId, string targetId)
@@ -161,21 +439,21 @@ public class GraphSearch
         if (startInternal == targetInternal) return new List<string> { startId };
 
         int nodeCount = _store.NodeCount;
-        float[] distances = new float[nodeCount + 1];
-        Array.Fill(distances, float.PositiveInfinity);
-        int[] parent = new int[nodeCount + 1];
+        var ws = TraversalScratchWorkspace.GetThreadStatic(nodeCount + 1);
+        ws.NextGeneration(nodeCount + 1);
+        ws.ResetHeap();
 
-        var pq = new PriorityQueue<int, float>();
-        distances[startInternal] = 0f;
-        pq.Enqueue(startInternal, 0f);
+        ws.Parent[startInternal] = 0;
+        ws.Distances[startInternal] = 0f;
+        ws.SetVisited(startInternal);
+        ws.EnqueueHeap(startInternal, 0f);
 
         bool found = false;
 
-        while (pq.Count > 0)
+        while (ws.TryDequeueHeap(out int current, out float curDist))
         {
-            pq.TryDequeue(out int current, out float curDist);
+            if (curDist > ws.Distances[current]) continue;
 
-            if (curDist > distances[current]) continue;
             if (current == targetInternal)
             {
                 found = true;
@@ -189,34 +467,100 @@ public class GraphSearch
                 float weight = edges.CurrentWeight > 0f ? edges.CurrentWeight : 1.0f;
                 float newDist = curDist + weight;
 
-                if (neighbor <= nodeCount && newDist < distances[neighbor])
+                if (neighbor <= nodeCount)
                 {
-                    distances[neighbor] = newDist;
-                    parent[neighbor] = current;
-                    pq.Enqueue(neighbor, newDist);
+                    if (!ws.IsVisited(neighbor) || newDist < ws.Distances[neighbor])
+                    {
+                        ws.SetVisited(neighbor);
+                        ws.Distances[neighbor] = newDist;
+                        ws.Parent[neighbor] = current;
+                        ws.EnqueueHeap(neighbor, newDist);
+                    }
                 }
                 edges.Advance();
             }
         }
 
-        var path = new List<string>();
-        if (found)
+        if (!found) return new List<string>();
+
+        int length = 0;
+        int curr = targetInternal;
+        while (curr != 0)
         {
-            int curr = targetInternal;
-            while (curr != 0)
-            {
-                path.Add(_store.GetExternalId(curr));
-                curr = parent[curr];
-            }
-            path.Reverse();
+            length++;
+            if (curr == startInternal) break;
+            curr = ws.Parent[curr];
         }
+
+        var path = new List<string>(length);
+        curr = targetInternal;
+        while (curr != 0)
+        {
+            path.Add(_store.GetExternalId(curr));
+            if (curr == startInternal) break;
+            curr = ws.Parent[curr];
+        }
+        path.Reverse();
 
         return path;
     }
 
     /// <summary>
     /// Finds all neighbors within a certain depth (hops) from the source node.
+    /// Writes neighbor internal IDs into <paramref name="neighborhoodBuffer"/> and returns the count.
+    /// Pure zero-allocation query path.
+    /// </summary>
+    public int FindNeighborhood(int sourceInternalId, int maxHops, Span<int> neighborhoodBuffer, TraversalScratchWorkspace? workspace = null)
+    {
+        int nodeCount = _store.NodeCount;
+        if (sourceInternalId <= 0 || sourceInternalId > nodeCount || maxHops <= 0 || neighborhoodBuffer.Length == 0)
+        {
+            return 0;
+        }
+
+        var ws = workspace ?? TraversalScratchWorkspace.GetThreadStatic(nodeCount + 1);
+        ws.NextGeneration(nodeCount + 1);
+        ws.ResetQueue();
+
+        ws.Enqueue(sourceInternalId);
+        ws.SetVisited(sourceInternalId);
+        ws.Distance[sourceInternalId] = 0;
+
+        int written = 0;
+
+        while (ws.HasQueueItems)
+        {
+            int current = ws.Dequeue();
+            int currentDist = ws.Distance[current];
+
+            if (currentDist > 0 && written < neighborhoodBuffer.Length)
+            {
+                neighborhoodBuffer[written++] = current;
+            }
+
+            if (currentDist >= maxHops) continue;
+
+            var edges = new GraphStore.EdgeEnumerator(current, _store);
+            while (edges.MoveNext())
+            {
+                int neighbor = edges.CurrentTargetNodeId;
+                if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                {
+                    ws.SetVisited(neighbor);
+                    ws.Distance[neighbor] = currentDist + 1;
+                    ws.Enqueue(neighbor);
+                }
+                edges.Advance();
+            }
+        }
+
+        return written;
+    }
+
+    /// <summary>
+    /// Finds all neighbors within a certain depth (hops) from the source node.
     /// Pure read-only query: does NOT mutate graph state.
+    /// Eliminates intermediate traversal heap allocations via pooled scratch buffers.
     /// </summary>
     public List<string> FindNeighborhood(string sourceId, int maxHops)
     {
@@ -226,20 +570,20 @@ public class GraphSearch
         }
 
         int nodeCount = _store.NodeCount;
-        bool[] visited = new bool[nodeCount + 1];
-        int[] distance = new int[nodeCount + 1];
+        var ws = TraversalScratchWorkspace.GetThreadStatic(nodeCount + 1);
+        ws.NextGeneration(nodeCount + 1);
+        ws.ResetQueue();
 
-        Queue<int> queue = new Queue<int>();
-        queue.Enqueue(startInternal);
-        visited[startInternal] = true;
-        distance[startInternal] = 0;
+        ws.Enqueue(startInternal);
+        ws.SetVisited(startInternal);
+        ws.Distance[startInternal] = 0;
 
         var neighborhood = new List<string>();
 
-        while (queue.Count > 0)
+        while (ws.HasQueueItems)
         {
-            int current = queue.Dequeue();
-            int currentDist = distance[current];
+            int current = ws.Dequeue();
+            int currentDist = ws.Distance[current];
 
             if (currentDist > 0)
             {
@@ -252,11 +596,11 @@ public class GraphSearch
             while (edges.MoveNext())
             {
                 int neighbor = edges.CurrentTargetNodeId;
-                if (neighbor <= nodeCount && !visited[neighbor])
+                if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
                 {
-                    visited[neighbor] = true;
-                    distance[neighbor] = currentDist + 1;
-                    queue.Enqueue(neighbor);
+                    ws.SetVisited(neighbor);
+                    ws.Distance[neighbor] = currentDist + 1;
+                    ws.Enqueue(neighbor);
                 }
                 edges.Advance();
             }
@@ -269,6 +613,7 @@ public class GraphSearch
     /// Traverses the multi-hop neighborhood from the source node, extracting full relational triplets
     /// with edge predicates and applying degree-based hub pruning.
     /// Pure read-only query: does NOT mutate graph state.
+    /// Eliminates intermediate traversal heap allocations via pooled scratch buffers.
     /// </summary>
     public List<GraphTriplet> FindNeighborhoodTriplets(
         string sourceId,
@@ -282,20 +627,20 @@ public class GraphSearch
         }
 
         int nodeCount = _store.NodeCount;
-        bool[] visited = new bool[nodeCount + 1];
-        int[] distance = new int[nodeCount + 1];
+        var ws = TraversalScratchWorkspace.GetThreadStatic(nodeCount + 1);
+        ws.NextGeneration(nodeCount + 1);
+        ws.ResetQueue();
 
-        var queue = new Queue<int>();
-        queue.Enqueue(startInternal);
-        visited[startInternal] = true;
-        distance[startInternal] = 0;
+        ws.Enqueue(startInternal);
+        ws.SetVisited(startInternal);
+        ws.Distance[startInternal] = 0;
 
         var triplets = new List<GraphTriplet>();
 
-        while (queue.Count > 0 && triplets.Count < maxTriplets)
+        while (ws.HasQueueItems && triplets.Count < maxTriplets)
         {
-            int current = queue.Dequeue();
-            int currentDist = distance[current];
+            int current = ws.Dequeue();
+            int currentDist = ws.Distance[current];
             if (currentDist >= maxHops) continue;
 
             string currentExternal = _store.GetExternalId(current);
@@ -313,11 +658,11 @@ public class GraphSearch
                 triplets.Add(new GraphTriplet(currentExternal, relationName, neighborExternal));
                 degreeCount++;
 
-                if (neighbor <= nodeCount && !visited[neighbor])
+                if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
                 {
-                    visited[neighbor] = true;
-                    distance[neighbor] = currentDist + 1;
-                    queue.Enqueue(neighbor);
+                    ws.SetVisited(neighbor);
+                    ws.Distance[neighbor] = currentDist + 1;
+                    ws.Enqueue(neighbor);
                 }
                 edges.Advance();
             }

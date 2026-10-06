@@ -167,6 +167,105 @@ namespace Glacier.Graph.Storage
         public int GetExternalToInternalId(string externalId) => _externalToInternalId.TryGetValue(externalId, out int val) ? val : 0;
         public string GetExternalId(int internalId) => _internalToExternalId.TryGetValue(internalId, out string? val) && val != null ? val : string.Empty;
 
+        public bool TryGetNeighbors(int internalId, out ReadOnlySpan<int> neighbors)
+        {
+            if (_basePointer != null && internalId > 0 && internalId <= NodeCount)
+            {
+                int* pRowOffsets = (int*)(_basePointer + _rowOffsetsStart);
+                int startIdx = pRowOffsets[internalId];
+                int endIdx = pRowOffsets[internalId + 1];
+                neighbors = new ReadOnlySpan<int>((int*)(_basePointer + _columnIndicesStart) + startIdx, endIdx - startIdx);
+                return true;
+            }
+
+            neighbors = default;
+            return false;
+        }
+
+        public ReadOnlySpan<int> GetRowOffsetsSpan()
+        {
+            if (_basePointer != null)
+            {
+                return new ReadOnlySpan<int>((int*)(_basePointer + _rowOffsetsStart), NodeCount + 2);
+            }
+            return default;
+        }
+
+        public ReadOnlySpan<int> GetColumnIndicesSpan()
+        {
+            if (_basePointer != null)
+            {
+                return new ReadOnlySpan<int>((int*)(_basePointer + _columnIndicesStart), EdgeCount);
+            }
+            return default;
+        }
+
+        public int GetNodeDegree(int internalId)
+        {
+            if (internalId <= 0 || internalId > NodeCount) return 0;
+
+            if (_basePointer != null)
+            {
+                int* pRowOffsets = (int*)(_basePointer + _rowOffsetsStart);
+                return pRowOffsets[internalId + 1] - pRowOffsets[internalId];
+            }
+
+            long rowOffsetPos = _rowOffsetsStart + internalId * sizeof(int);
+            int s = ReadInt32(rowOffsetPos);
+            int e = ReadInt32(rowOffsetPos + sizeof(int));
+            return e - s;
+        }
+
+        public bool ContainsNeighbor(int internalId, int targetNeighborId)
+        {
+            if (TryGetNeighbors(internalId, out var neighbors))
+            {
+                return Glacier.Graph.Kernels.CsrKernels.ContainsNeighbor(neighbors, targetNeighborId);
+            }
+
+            var edges = GetOutwardEdgesByInternalId(internalId);
+            while (edges.MoveNext())
+            {
+                if (edges.CurrentTargetNodeId == targetNeighborId) return true;
+                edges.Advance();
+            }
+            return false;
+        }
+
+        public void ComputeDegrees(int startNode, Span<int> destination)
+        {
+            if (_basePointer != null)
+            {
+                var rowOffsets = GetRowOffsetsSpan();
+                Glacier.Graph.Kernels.CsrKernels.ComputeDegrees(rowOffsets, startNode, destination);
+            }
+            else
+            {
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = GetNodeDegree(startNode + i);
+                }
+            }
+        }
+
+        public int CountCommonNeighbors(int nodeA, int nodeB, bool isSorted = false)
+        {
+            if (TryGetNeighbors(nodeA, out var neighborsA) && TryGetNeighbors(nodeB, out var neighborsB))
+            {
+                return Glacier.Graph.Kernels.CsrKernels.CountCommonNeighbors(neighborsA, neighborsB, isSorted);
+            }
+
+            int count = 0;
+            var edgesA = GetOutwardEdgesByInternalId(nodeA);
+            while (edgesA.MoveNext())
+            {
+                int neighbor = edgesA.CurrentTargetNodeId;
+                if (ContainsNeighbor(nodeB, neighbor)) count++;
+                edgesA.Advance();
+            }
+            return count;
+        }
+
         public CsrEdgeEnumerator GetOutwardEdgesByInternalId(int internalId)
         {
             if (_basePointer != null)
