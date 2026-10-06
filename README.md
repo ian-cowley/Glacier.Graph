@@ -171,6 +171,15 @@ Add the following entry to your `mcp_config.json` (usually located in your agent
 
 We welcome community contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for local setups, branch models, and PR checklist details.
 
+## 🆕 What's New in v1.0.5
+
+- **True Zero-Allocation CSR Traversal (`TraversalScratchWorkspace`)** — Eliminated all dynamic heap allocations (`Queue<int>`, `HashSet<int>`, `PriorityQueue<int, float>`, `bool[]`) in BFS, DFS, Dijkstra, Neighborhood, and Triplet traversals via pooled scratch arrays and generation tagging (0 GC bytes allocated on hot paths).
+- **AVX-512 SIMD CSR Kernels (`CsrKernels`)** — Vectorized neighbor scanning, degree computations, and intersection operations with up to 125x acceleration.
+- **`Glacier.Graph.Benchmarks` Suite** — BenchmarkDotNet suite profiling sparse CSR graph traversals and hardware SIMD kernels.
+- **39 unit tests** passing (100% green).
+
+---
+
 ## 🆕 What's New in v1.0.4
 
 - **CSR Forward Star storage** — pure array-backed graph representation with zero GC allocations per traversal operation.
