@@ -11,82 +11,116 @@ using Glacier.Graph.Traversal;
 namespace Glacier.Graph.Mcp
 {
     /// <summary>
-    /// A zero-dependency Model Context Protocol (MCP) server over Stdio.
-    /// Exposes the high-performance Glacier.Graph engine to AI agents.
+    /// A zero-dependency, Native AOT-compatible Model Context Protocol (MCP) server over Stdio.
+    /// Exposes the high-performance Glacier.Graph engine to AI agents using source-generated JSON serialization.
     /// </summary>
     public class GraphMcpServer
     {
+        private readonly object _stateLock = new();
         private GraphStore _store;
         private GraphSearch _search;
-        private readonly StreamReader _reader;
-        private readonly StreamWriter _writer;
-        private readonly string _logPath;
+        private bool _ownsCurrentStore;
 
-        private static readonly JsonSerializerOptions JsonOpts = new()
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-        };
-
-        private void Log(string message)
-        {
-            try
-            {
-                File.AppendAllText(_logPath, $"[{DateTime.Now:T}] {message}\n");
-            }
-            catch { /* Ignore logging errors */ }
-        }
+        private readonly TextReader _reader;
+        private readonly TextWriter _writer;
+        private readonly bool _debugLoggingEnabled;
 
         public GraphMcpServer(GraphStore store, GraphSearch search)
+            : this(
+                store,
+                search,
+                new StreamReader(Console.OpenStandardInput(), Encoding.UTF8),
+                CreateStdOutWriter())
+        {
+        }
+
+        public GraphMcpServer(GraphStore store, GraphSearch search, Stream input, Stream output)
+            : this(
+                store,
+                search,
+                new StreamReader(input ?? throw new ArgumentNullException(nameof(input)), Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true),
+                CreateUtf8NoBomWriter(output ?? throw new ArgumentNullException(nameof(output))))
+        {
+        }
+
+        public GraphMcpServer(GraphStore store, GraphSearch search, TextReader reader, TextWriter writer)
         {
             _store = store ?? throw new ArgumentNullException(nameof(store));
             _search = search ?? throw new ArgumentNullException(nameof(search));
-            _logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mcp_log.txt");
+            _reader = reader ?? throw new ArgumentNullException(nameof(reader));
+            _writer = writer ?? throw new ArgumentNullException(nameof(writer));
 
-            Log("Server instance created.");
+            string? debugEnv = Environment.GetEnvironmentVariable("GLACIER_GRAPH_MCP_DEBUG");
+            _debugLoggingEnabled = string.Equals(debugEnv, "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(debugEnv, "true", StringComparison.OrdinalIgnoreCase);
 
-            // Setup standard IO for MCP communication
-            Stream openStandardInput = Console.OpenStandardInput();
-            _reader = new StreamReader(openStandardInput);
+            Log("Glacier.Graph MCP server initialized.");
+        }
 
-            Stream openStandardOutput = Console.OpenStandardOutput();
-            // Use UTF8 without BOM (important for some MCP hosts)
-            _writer = new StreamWriter(openStandardOutput, new UTF8Encoding(false)) { AutoFlush = true };
-            _writer.NewLine = "\n";
-            
-            Log("IO setup complete.");
+        private static StreamWriter CreateStdOutWriter()
+        {
+            return CreateUtf8NoBomWriter(Console.OpenStandardOutput());
+        }
+
+        private static StreamWriter CreateUtf8NoBomWriter(Stream output)
+        {
+            var writer = new StreamWriter(output, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), bufferSize: 4096, leaveOpen: true)
+            {
+                AutoFlush = true,
+                NewLine = "\n"
+            };
+            return writer;
+        }
+
+        private void Log(string message)
+        {
+            if (!_debugLoggingEnabled) return;
+
+            try
+            {
+                Console.Error.WriteLine($"[Glacier.Graph.MCP {DateTime.UtcNow:O}] {message}");
+            }
+            catch
+            {
+                // Never crash on diagnostic stderr output failure
+            }
         }
 
         public async Task RunAsync()
         {
-            // The main JSON-RPC listening loop
             while (await _reader.ReadLineAsync() is { } line)
             {
                 if (string.IsNullOrWhiteSpace(line)) continue;
 
-                JsonElement requestId = default;
+                JsonElement? requestId = null;
                 try
                 {
                     Log($"Received: {line}");
                     using var doc = JsonDocument.Parse(line);
                     var root = doc.RootElement;
 
+                    if (root.TryGetProperty("id", out JsonElement idElem) && idElem.ValueKind != JsonValueKind.Undefined)
+                    {
+                        requestId = idElem.Clone();
+                    }
+
                     if (!root.TryGetProperty("method", out JsonElement methodElem))
                     {
                         Log("Message missing 'method' property.");
+                        if (requestId.HasValue && requestId.Value.ValueKind != JsonValueKind.Null)
+                        {
+                            await SendErrorAsync(requestId, -32600, "Invalid Request: missing 'method' property.");
+                        }
                         continue;
                     }
 
-                    string method = methodElem.GetString() ?? "";
-                    root.TryGetProperty("id", out requestId);
-
+                    string method = methodElem.GetString() ?? string.Empty;
                     Log($"Method: {method}");
 
-                    // Route the MCP Methods
                     switch (method)
                     {
                         case "initialize":
-                            await SendResponseAsync(requestId, HandleInitialize());
+                            await SendInitializeResponseAsync(requestId, HandleInitialize());
                             break;
 
                         case "notifications/initialized":
@@ -98,16 +132,16 @@ namespace Glacier.Graph.Mcp
                             break;
 
                         case "tools/list":
-                            await SendResponseAsync(requestId, HandleToolsList());
+                            await SendToolsListResponseAsync(requestId, HandleToolsList());
                             break;
 
                         case "tools/call":
                             try
                             {
-                                if (root.TryGetProperty("params", out JsonElement parameters))
+                                if (root.TryGetProperty("params", out JsonElement parameters) && parameters.ValueKind == JsonValueKind.Object)
                                 {
-                                    var result = await HandleToolCallAsync(parameters);
-                                    await SendResponseAsync(requestId, result);
+                                    McpToolCallResult result = HandleToolCall(parameters);
+                                    await SendToolCallResponseAsync(requestId, result);
                                 }
                                 else
                                 {
@@ -123,17 +157,22 @@ namespace Glacier.Graph.Mcp
 
                         default:
                             Log($"Method '{method}' not handled.");
-                            if (requestId.ValueKind != JsonValueKind.Undefined && requestId.ValueKind != JsonValueKind.Null)
+                            if (requestId.HasValue && requestId.Value.ValueKind != JsonValueKind.Null)
                             {
                                 await SendErrorAsync(requestId, -32601, $"Method '{method}' not found.");
                             }
                             break;
                     }
                 }
+                catch (JsonException jsonEx)
+                {
+                    Log($"JSON parse error: {jsonEx.Message}");
+                    await SendErrorAsync(requestId, -32700, "Parse error.");
+                }
                 catch (Exception ex)
                 {
-                    Log($"CRITICAL ERROR: {ex.Message}\n{ex.StackTrace}");
-                    if (requestId.ValueKind != JsonValueKind.Undefined && requestId.ValueKind != JsonValueKind.Null)
+                    Log($"CRITICAL ERROR: {ex.Message}");
+                    if (requestId.HasValue && requestId.Value.ValueKind != JsonValueKind.Null)
                     {
                         try { await SendErrorAsync(requestId, -32603, "Internal server error."); } catch { }
                     }
@@ -141,259 +180,468 @@ namespace Glacier.Graph.Mcp
             }
         }
 
-        private object HandleInitialize()
+        private static McpInitializeResult HandleInitialize()
         {
-            return new
+            return new McpInitializeResult
             {
-                protocolVersion = "2024-11-05",
-                capabilities = new { tools = new { listChanged = false } },
-                serverInfo = new { name = "Glacier.Graph", version = "1.0.0" }
+                ProtocolVersion = "2024-11-05",
+                Capabilities = new McpCapabilities
+                {
+                    Tools = new McpToolsCapability { ListChanged = false }
+                },
+                ServerInfo = new McpServerInfo
+                {
+                    Name = "Glacier.Graph",
+                    Version = "1.1.0"
+                }
             };
         }
 
-        private object HandleToolsList()
+        private static McpToolsListResult HandleToolsList()
         {
-            return new
+            return new McpToolsListResult
             {
-                tools = new[]
-                {
-                    new Dictionary<string, object>
+                Tools =
+                [
+                    new McpToolDefinition
                     {
-                        { "name", "add_node" },
-                        { "description", "Registers a new node in the graph, or updates its metadata if it already exists." },
-                        { "inputSchema", new Dictionary<string, object>
+                        Name = "add_node",
+                        Description = "Registers a new node in the graph, or updates its metadata if it already exists.",
+                        InputSchema = new McpInputSchema
+                        {
+                            Type = "object",
+                            Properties = new Dictionary<string, McpPropertySchema>
                             {
-                                { "type", "object" },
-                                { "properties", new Dictionary<string, object>
-                                    {
-                                        { "id", new Dictionary<string, object> { { "type", "string" }, { "description", "The unique identifier of the node." } } },
-                                        { "metadata", new Dictionary<string, object> { { "type", "string" }, { "description", "Optional JSON or text metadata associated with the node." } } }
-                                    }
-                                },
-                                { "required", new[] { "id" } }
+                                ["id"] = new() { Type = "string", Description = "The unique identifier of the node." },
+                                ["metadata"] = new() { Type = "string", Description = "Optional JSON or text metadata associated with the node." }
+                            },
+                            Required = ["id"]
+                        }
+                    },
+                    new McpToolDefinition
+                    {
+                        Name = "add_edge",
+                        Description = "Creates a directed relationship between two nodes with an optional non-negative weight. Automatically creates the nodes if they don't exist.",
+                        InputSchema = new McpInputSchema
+                        {
+                            Type = "object",
+                            Properties = new Dictionary<string, McpPropertySchema>
+                            {
+                                ["source"] = new() { Type = "string", Description = "The starting node identifier." },
+                                ["target"] = new() { Type = "string", Description = "The ending node identifier." },
+                                ["relation"] = new() { Type = "string", Description = "The type of relation (e.g., KNOWS, FOLLOWS, REPORTS_TO)." },
+                                ["weight"] = new() { Type = "number", Description = "Optional non-negative edge weight (defaults to 1.0)." }
+                            },
+                            Required = ["source", "target", "relation"]
+                        }
+                    },
+                    new McpToolDefinition
+                    {
+                        Name = "find_shortest_path",
+                        Description = "Finds the shortest path between two nodes using Breadth-First Search (BFS) or weighted Dijkstra when 'weighted' is true.",
+                        InputSchema = new McpInputSchema
+                        {
+                            Type = "object",
+                            Properties = new Dictionary<string, McpPropertySchema>
+                            {
+                                ["startId"] = new() { Type = "string", Description = "The starting node identifier." },
+                                ["targetId"] = new() { Type = "string", Description = "The target node identifier." },
+                                ["weighted"] = new() { Type = "boolean", Description = "Optional flag to run weighted Dijkstra instead of unweighted BFS." }
+                            },
+                            Required = ["startId", "targetId"]
+                        }
+                    },
+                    new McpToolDefinition
+                    {
+                        Name = "find_neighborhood",
+                        Description = "Finds all connected neighbor nodes within a specific hop distance from a source node.",
+                        InputSchema = new McpInputSchema
+                        {
+                            Type = "object",
+                            Properties = new Dictionary<string, McpPropertySchema>
+                            {
+                                ["sourceId"] = new() { Type = "string", Description = "The source node identifier." },
+                                ["maxHops"] = new() { Type = "integer", Description = "The maximum hop distance (depth) of neighbors to retrieve." }
+                            },
+                            Required = ["sourceId", "maxHops"]
+                        }
+                    },
+                    new McpToolDefinition
+                    {
+                        Name = "save_graph",
+                        Description = "Persists the current raw graph memory arrays to a disk file.",
+                        InputSchema = new McpInputSchema
+                        {
+                            Type = "object",
+                            Properties = new Dictionary<string, McpPropertySchema>
+                            {
+                                ["filePath"] = new() { Type = "string", Description = "The file path to save to (defaults to graph_database.bin)." }
                             }
                         }
                     },
-                    new Dictionary<string, object>
+                    new McpToolDefinition
                     {
-                        { "name", "add_edge" },
-                        { "description", "Creates a directed relationship between two nodes. Automatically creates the nodes if they don't exist." },
-                        { "inputSchema", new Dictionary<string, object>
+                        Name = "load_graph",
+                        Description = "Loads a persisted graph database file from disk into memory.",
+                        InputSchema = new McpInputSchema
+                        {
+                            Type = "object",
+                            Properties = new Dictionary<string, McpPropertySchema>
                             {
-                                { "type", "object" },
-                                { "properties", new Dictionary<string, object>
-                                    {
-                                        { "source", new Dictionary<string, object> { { "type", "string" }, { "description", "The starting node identifier." } } },
-                                        { "target", new Dictionary<string, object> { { "type", "string" }, { "description", "The ending node identifier." } } },
-                                        { "relation", new Dictionary<string, object> { { "type", "string" }, { "description", "The type of relation (e.g., KNOWS, FOLLOWS, REPORTS_TO)." } } }
-                                    }
-                                },
-                                { "required", new[] { "source", "target", "relation" } }
+                                ["filePath"] = new() { Type = "string", Description = "The file path to load from (defaults to graph_database.bin)." }
                             }
                         }
                     },
-                    new Dictionary<string, object>
+                    new McpToolDefinition
                     {
-                        { "name", "find_shortest_path" },
-                        { "description", "Finds the shortest path between two nodes using high-performance Breadth-First Search (BFS)." },
-                        { "inputSchema", new Dictionary<string, object>
-                            {
-                                { "type", "object" },
-                                { "properties", new Dictionary<string, object>
-                                    {
-                                        { "startId", new Dictionary<string, object> { { "type", "string" }, { "description", "The starting node identifier." } } },
-                                        { "targetId", new Dictionary<string, object> { { "type", "string" }, { "description", "The target node identifier." } } }
-                                    }
-                                },
-                                { "required", new[] { "startId", "targetId" } }
-                            }
-                        }
-                    },
-                    new Dictionary<string, object>
-                    {
-                        { "name", "find_neighborhood" },
-                        { "description", "Finds all connected neighbor nodes within a specific hop distance from a source node." },
-                        { "inputSchema", new Dictionary<string, object>
-                            {
-                                { "type", "object" },
-                                { "properties", new Dictionary<string, object>
-                                    {
-                                        { "sourceId", new Dictionary<string, object> { { "type", "string" }, { "description", "The source node identifier." } } },
-                                        { "maxHops", new Dictionary<string, object> { { "type", "integer" }, { "description", "The maximum hop distance (depth) of neighbors to retrieve." } } }
-                                    }
-                                },
-                                { "required", new[] { "sourceId", "maxHops" } }
-                            }
-                        }
-                    },
-                    new Dictionary<string, object>
-                    {
-                        { "name", "save_graph" },
-                        { "description", "Persists the current raw graph memory arrays to a disk file." },
-                        { "inputSchema", new Dictionary<string, object>
-                            {
-                                { "type", "object" },
-                                { "properties", new Dictionary<string, object>
-                                    {
-                                        { "filePath", new Dictionary<string, object> { { "type", "string" }, { "description", "The file path to save to (defaults to graph_database.bin)." } } }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    new Dictionary<string, object>
-                    {
-                        { "name", "load_graph" },
-                        { "description", "Loads a persisted graph database file from disk into memory." },
-                        { "inputSchema", new Dictionary<string, object>
-                            {
-                                { "type", "object" },
-                                { "properties", new Dictionary<string, object>
-                                    {
-                                        { "filePath", new Dictionary<string, object> { { "type", "string" }, { "description", "The file path to load from (defaults to graph_database.bin)." } } }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    new Dictionary<string, object>
-                    {
-                        { "name", "ping" },
-                        { "description", "A simple ping tool to verify the graph server is responding." },
-                        { "inputSchema", new Dictionary<string, object>
-                            {
-                                { "type", "object" },
-                                { "properties", new Dictionary<string, object>() }
-                            }
+                        Name = "ping",
+                        Description = "A simple ping tool to verify the graph server is responding.",
+                        InputSchema = new McpInputSchema
+                        {
+                            Type = "object",
+                            Properties = new Dictionary<string, McpPropertySchema>()
                         }
                     }
-                }
+                ]
             };
         }
 
-        private async Task<object> HandleToolCallAsync(JsonElement parameters)
+        private McpToolCallResult HandleToolCall(JsonElement parameters)
         {
-            string name = parameters.GetProperty("name").GetString() ?? "";
-            JsonElement args = parameters.GetProperty("arguments");
-
-            if (name == "ping")
+            if (!parameters.TryGetProperty("name", out JsonElement nameElem))
             {
-                return CreateToolResponse("pong");
+                throw new ArgumentException("Missing tool 'name'.");
             }
-            else if (name == "add_node")
-            {
-                string nodeId = args.GetProperty("id").GetString()!;
-                string metadata = args.TryGetProperty("metadata", out JsonElement m) ? m.GetString() ?? "" : "";
-                
-                int internalId = _store.AddNode(nodeId, metadata);
-                return CreateToolResponse($"Successfully added node: '{nodeId}' with metadata: '{metadata}' (Internal ID: {internalId}). Total Nodes: {_store.NodeCount}");
-            }
-            else if (name == "add_edge")
-            {
-                string source = args.GetProperty("source").GetString()!;
-                string target = args.GetProperty("target").GetString()!;
-                string relation = args.GetProperty("relation").GetString()!;
 
-                _store.AddEdge(source, target, relation);
-                return CreateToolResponse($"Successfully linked {source} -> {relation} -> {target}. Total Edges: {_store.EdgeCount}");
-            }
-            else if (name == "find_shortest_path")
-            {
-                string start = args.GetProperty("startId").GetString()!;
-                string target = args.GetProperty("targetId").GetString()!;
+            string name = nameElem.GetString() ?? string.Empty;
+            JsonElement args = parameters.TryGetProperty("arguments", out JsonElement argsElem) && argsElem.ValueKind == JsonValueKind.Object
+                ? argsElem
+                : default;
 
-                var path = _search.FindShortestPath(start, target);
-                string content = path.Count > 0
-                    ? $"Path found: {string.Join(" -> ", path)}"
-                    : $"No path exists between '{start}' and '{target}'.";
-
-                return CreateToolResponse(content);
-            }
-            else if (name == "find_neighborhood")
+            switch (name)
             {
-                string source = args.GetProperty("sourceId").GetString()!;
-                int maxHops = args.GetProperty("maxHops").GetInt32();
+                case "ping":
+                    return CreateToolResponse("pong");
 
-                var neighbors = _search.FindNeighborhood(source, maxHops);
-                string content = neighbors.Count > 0
-                    ? $"Found {neighbors.Count} nodes within {maxHops} hops:\n{string.Join(", ", neighbors)}"
-                    : $"No neighbors found within {maxHops} hops for '{source}'.";
-
-                return CreateToolResponse(content);
-            }
-            else if (name == "save_graph")
-            {
-                string filePath = args.TryGetProperty("filePath", out JsonElement pathElem) ? pathElem.GetString() ?? "graph_database.bin" : "graph_database.bin";
-                
-                _store.SaveToDisk(filePath);
-                
-                long size = new FileInfo(filePath).Length;
-                return CreateToolResponse($"Successfully persisted raw graph arrays to '{filePath}' ({size / 1024.0 / 1024.0:F2} MB). Verified Nodes: {_store.NodeCount} | Edges: {_store.EdgeCount}");
-            }
-            else if (name == "load_graph")
-            {
-                string filePath = args.TryGetProperty("filePath", out JsonElement pathElem) ? pathElem.GetString() ?? "graph_database.bin" : "graph_database.bin";
-                
-                if (!File.Exists(filePath))
+                case "add_node":
                 {
-                    throw new FileNotFoundException($"Graph database file not found at path: '{filePath}'");
+                    string nodeId = GetRequiredString(args, "id");
+                    string metadata = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("metadata", out JsonElement m)
+                        ? (m.GetString() ?? string.Empty)
+                        : string.Empty;
+
+                    lock (_stateLock)
+                    {
+                        int internalId = _store.AddNode(nodeId, metadata);
+                        return CreateToolResponse(
+                            $"Successfully added node: '{nodeId}' with metadata: '{metadata}' (Internal ID: {internalId}). Total Nodes: {_store.NodeCount}");
+                    }
                 }
 
-                var revivedStore = GraphStore.LoadFromDisk(filePath);
-                _store = revivedStore;
-                _search = new GraphSearch(revivedStore);
-
-                return CreateToolResponse($"Successfully loaded graph database from '{filePath}'. Verified Nodes: {_store.NodeCount} | Edges: {_store.EdgeCount}");
-            }
-
-            throw new Exception($"Tool '{name}' is not supported.");
-        }
-
-        private static object CreateToolResponse(string text)
-        {
-            return new
-            {
-                content = new[]
+                case "add_edge":
                 {
-                    new { type = "text", text = text }
+                    string source = GetRequiredString(args, "source");
+                    string target = GetRequiredString(args, "target");
+                    string relation = GetRequiredString(args, "relation");
+                    float weight = args.ValueKind == JsonValueKind.Object
+                        && args.TryGetProperty("weight", out JsonElement wElem)
+                        && wElem.ValueKind == JsonValueKind.Number
+                        ? wElem.GetSingle()
+                        : 1.0f;
+
+                    lock (_stateLock)
+                    {
+                        _store.AddEdge(source, target, relation, weight);
+                        return CreateToolResponse(
+                            $"Successfully linked {source} -> {relation} -> {target}. Total Edges: {_store.EdgeCount}");
+                    }
                 }
+
+                case "find_shortest_path":
+                {
+                    string start = GetRequiredString(args, "startId");
+                    string target = GetRequiredString(args, "targetId");
+                    bool weighted = args.ValueKind == JsonValueKind.Object
+                        && args.TryGetProperty("weighted", out JsonElement weightedElem)
+                        && (weightedElem.ValueKind == JsonValueKind.True || weightedElem.ValueKind == JsonValueKind.False)
+                        && weightedElem.GetBoolean();
+
+                    List<string> path;
+                    lock (_stateLock)
+                    {
+                        path = weighted
+                            ? _search.FindShortestPathDijkstra(start, target)
+                            : _search.FindShortestPath(start, target);
+                    }
+
+                    string content = path.Count > 0
+                        ? $"Path found: {string.Join(" -> ", path)}"
+                        : $"No path exists between '{start}' and '{target}'.";
+
+                    return CreateToolResponse(content);
+                }
+
+                case "find_neighborhood":
+                {
+                    string source = GetRequiredString(args, "sourceId");
+                    if (args.ValueKind != JsonValueKind.Object || !args.TryGetProperty("maxHops", out JsonElement maxHopsElem))
+                    {
+                        throw new ArgumentException("Missing required argument 'maxHops'.");
+                    }
+
+                    int maxHops = maxHopsElem.GetInt32();
+                    List<string> neighbors;
+                    lock (_stateLock)
+                    {
+                        neighbors = _search.FindNeighborhood(source, maxHops);
+                    }
+
+                    string content = neighbors.Count > 0
+                        ? $"Found {neighbors.Count} nodes within {maxHops} hops:\n{string.Join(", ", neighbors)}"
+                        : $"No neighbors found within {maxHops} hops for '{source}'.";
+
+                    return CreateToolResponse(content);
+                }
+
+                case "save_graph":
+                {
+                    string filePath = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("filePath", out JsonElement pathElem)
+                        ? (pathElem.GetString() ?? "graph_database.bin")
+                        : "graph_database.bin";
+
+                    int nodeCount;
+                    int edgeCount;
+                    lock (_stateLock)
+                    {
+                        _store.SaveToDisk(filePath);
+                        nodeCount = _store.NodeCount;
+                        edgeCount = _store.EdgeCount;
+                    }
+
+                    long size = new FileInfo(filePath).Length;
+                    return CreateToolResponse(
+                        $"Successfully persisted raw graph arrays to '{filePath}' ({size / 1024.0 / 1024.0:F2} MB). Verified Nodes: {nodeCount} | Edges: {edgeCount}");
+                }
+
+                case "load_graph":
+                {
+                    string filePath = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("filePath", out JsonElement pathElem)
+                        ? (pathElem.GetString() ?? "graph_database.bin")
+                        : "graph_database.bin";
+
+                    if (!File.Exists(filePath))
+                    {
+                        throw new FileNotFoundException($"Graph database file not found at path: '{filePath}'", filePath);
+                    }
+
+                    var revivedStore = GraphStore.LoadFromDisk(filePath);
+                    var revivedSearch = new GraphSearch(revivedStore);
+                    GraphStore? previousOwnedStore = null;
+                    int nodeCount;
+                    int edgeCount;
+
+                    lock (_stateLock)
+                    {
+                        if (_ownsCurrentStore && !ReferenceEquals(_store, revivedStore))
+                        {
+                            previousOwnedStore = _store;
+                        }
+
+                        _store = revivedStore;
+                        _search = revivedSearch;
+                        _ownsCurrentStore = true;
+                        nodeCount = _store.NodeCount;
+                        edgeCount = _store.EdgeCount;
+                    }
+
+                    previousOwnedStore?.Dispose();
+
+                    return CreateToolResponse(
+                        $"Successfully loaded graph database from '{filePath}'. Verified Nodes: {nodeCount} | Edges: {edgeCount}");
+                }
+
+                default:
+                    throw new NotSupportedException($"Tool '{name}' is not supported.");
+            }
+        }
+
+        private static string GetRequiredString(JsonElement args, string propertyName)
+        {
+            if (args.ValueKind != JsonValueKind.Object
+                || !args.TryGetProperty(propertyName, out JsonElement prop)
+                || prop.ValueKind != JsonValueKind.String)
+            {
+                throw new ArgumentException($"Missing required string argument '{propertyName}'.");
+            }
+
+            return prop.GetString() ?? string.Empty;
+        }
+
+        private static McpToolCallResult CreateToolResponse(string text)
+        {
+            return new McpToolCallResult
+            {
+                Content =
+                [
+                    new McpContentItem { Type = "text", Text = text }
+                ]
             };
         }
 
-        private async Task SendResponseAsync(JsonElement id, object result)
+        private async Task SendInitializeResponseAsync(JsonElement? id, McpInitializeResult result)
         {
-            var response = new Dictionary<string, object>
+            var envelope = new McpInitializeResponse
             {
-                ["jsonrpc"] = "2.0",
-                ["result"] = result
+                Id = id,
+                Result = result
             };
-
-            if (id.ValueKind != JsonValueKind.Undefined)
-            {
-                response["id"] = id;
-            }
-
-            string json = JsonSerializer.Serialize(response, JsonOpts);
+            string json = JsonSerializer.Serialize(envelope, GraphMcpJsonContext.Default.McpInitializeResponse);
             Log($"Sending response: {json}");
             await _writer.WriteLineAsync(json);
         }
 
-        private async Task SendErrorAsync(JsonElement id, int code, string message)
+        private async Task SendToolsListResponseAsync(JsonElement? id, McpToolsListResult result)
         {
-            var response = new Dictionary<string, object>
+            var envelope = new McpToolsListResponse
             {
-                ["jsonrpc"] = "2.0",
-                ["error"] = new { code, message }
+                Id = id,
+                Result = result
             };
+            string json = JsonSerializer.Serialize(envelope, GraphMcpJsonContext.Default.McpToolsListResponse);
+            Log($"Sending response: {json}");
+            await _writer.WriteLineAsync(json);
+        }
 
-            if (id.ValueKind != JsonValueKind.Undefined)
+        private async Task SendToolCallResponseAsync(JsonElement? id, McpToolCallResult result)
+        {
+            var envelope = new McpToolCallResponse
             {
-                response["id"] = id;
-            }
+                Id = id,
+                Result = result
+            };
+            string json = JsonSerializer.Serialize(envelope, GraphMcpJsonContext.Default.McpToolCallResponse);
+            Log($"Sending response: {json}");
+            await _writer.WriteLineAsync(json);
+        }
 
-            string json = JsonSerializer.Serialize(response, JsonOpts);
+        private async Task SendErrorAsync(JsonElement? id, int code, string message)
+        {
+            var envelope = new McpErrorResponse
+            {
+                Id = id,
+                Error = new McpRpcError { Code = code, Message = message }
+            };
+            string json = JsonSerializer.Serialize(envelope, GraphMcpJsonContext.Default.McpErrorResponse);
             Log($"Sending error: {json}");
             await _writer.WriteLineAsync(json);
         }
+    }
+
+    // --- Native AOT Typed MCP DTOs ---
+
+    public sealed class McpInitializeResponse
+    {
+        public string Jsonrpc { get; init; } = "2.0";
+        public JsonElement? Id { get; init; }
+        public required McpInitializeResult Result { get; init; }
+    }
+
+    public sealed class McpToolsListResponse
+    {
+        public string Jsonrpc { get; init; } = "2.0";
+        public JsonElement? Id { get; init; }
+        public required McpToolsListResult Result { get; init; }
+    }
+
+    public sealed class McpToolCallResponse
+    {
+        public string Jsonrpc { get; init; } = "2.0";
+        public JsonElement? Id { get; init; }
+        public required McpToolCallResult Result { get; init; }
+    }
+
+    public sealed class McpErrorResponse
+    {
+        public string Jsonrpc { get; init; } = "2.0";
+        public JsonElement? Id { get; init; }
+        public required McpRpcError Error { get; init; }
+    }
+
+    public sealed class McpRpcError
+    {
+        public int Code { get; init; }
+        public required string Message { get; init; }
+    }
+
+    public sealed class McpInitializeResult
+    {
+        public required string ProtocolVersion { get; init; }
+        public required McpCapabilities Capabilities { get; init; }
+        public required McpServerInfo ServerInfo { get; init; }
+    }
+
+    public sealed class McpCapabilities
+    {
+        public required McpToolsCapability Tools { get; init; }
+    }
+
+    public sealed class McpToolsCapability
+    {
+        public bool ListChanged { get; init; }
+    }
+
+    public sealed class McpServerInfo
+    {
+        public required string Name { get; init; }
+        public required string Version { get; init; }
+    }
+
+    public sealed class McpToolsListResult
+    {
+        public required McpToolDefinition[] Tools { get; init; }
+    }
+
+    public sealed class McpToolDefinition
+    {
+        public required string Name { get; init; }
+        public required string Description { get; init; }
+        public required McpInputSchema InputSchema { get; init; }
+    }
+
+    public sealed class McpInputSchema
+    {
+        public required string Type { get; init; }
+        public required Dictionary<string, McpPropertySchema> Properties { get; init; }
+        public string[]? Required { get; init; }
+    }
+
+    public sealed class McpPropertySchema
+    {
+        public required string Type { get; init; }
+        public string? Description { get; init; }
+    }
+
+    public sealed class McpToolCallResult
+    {
+        public required McpContentItem[] Content { get; init; }
+        public bool? IsError { get; init; }
+    }
+
+    public sealed class McpContentItem
+    {
+        public required string Type { get; init; }
+        public required string Text { get; init; }
+    }
+
+    [JsonSourceGenerationOptions(
+        PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        WriteIndented = false)]
+    [JsonSerializable(typeof(McpInitializeResponse))]
+    [JsonSerializable(typeof(McpToolsListResponse))]
+    [JsonSerializable(typeof(McpToolCallResponse))]
+    [JsonSerializable(typeof(McpErrorResponse))]
+    public partial class GraphMcpJsonContext : JsonSerializerContext
+    {
     }
 }

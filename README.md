@@ -27,18 +27,18 @@
 ========================================================================================================
 ```
 
-**Glacier.Graph** is a high-performance, zero-allocation array-backed graph database and traversal engine for .NET 10. Designed for AI agents, semantic reasoning, and ultra-low latency graph operations, it uses a **Forward Star representation** to pack nodes, edges, and relationships in primitive contiguous arrays, completely bypassing Garbage Collector (GC) pressure and maximizing CPU cache hits.
+**Glacier.Graph** (`v1.1.0`) is a high-performance, zero-allocation, Native AOT-compatible graph database and traversal engine for **.NET 10**. Designed for AI agents, semantic knowledge graphs, and ultra-low-latency graph analytics, it pairs a concurrent **Forward Star** in-memory store with a memory-mapped / LRU-paged **Compressed Sparse Row (CSR)** engine, AVX-512 SIMD kernels, weighted Dijkstra pathfinding, and a zero-dependency MCP server.
 
 ---
 
 ## Key Features
 
-*   ⚡ **Zero-Allocation Architecture**: Stores all nodes, edges, and relationships inside contiguous primitive arrays (`int[]`). Bypasses the .NET Garbage Collector for high-frequency traversal operations.
-*   🚀 **Forward Star Representation**: An optimized data structure representation for graphs that guarantees sequential memory access and extreme traversal performance.
-*   🗜️ **CSR Out-of-Core Execution**: Compile graphs into a static Compressed Sparse Row (CSR) format with a configurable `maxMemoryBytes` parameter, enabling traversal of massive graphs on embedded/constrained hardware by enforcing a strict software LRU page cache.
-*   🧠 **High-Speed Traversal**: Features built-in, cache-line optimized algorithms for Breadth-First Search (BFS) and hop-distance neighborhood discovery.
-*   💾 **RAM-to-Disk Dumping**: Support for ultra-fast, zero-copy serialization (`GLGR` binary format) to quickly dump and revive huge graphs from disk in milliseconds.
-*   🤖 **MCP Server Support**: Includes a built-in Model Context Protocol (MCP) server interface, making it seamlessly compatible with LLM agents (like Claude or Antigravity) as an active memory reasoning tool.
+*   ⚡ **Zero-Allocation Traversal (`TraversalScratchWorkspace`)**: Pooled primitive buffers and `O(1)` generation-tagged visited tracking achieve **0 bytes** of GC heap allocation across BFS, DFS, weighted Dijkstra, and K-hop neighborhood `Span<int>` queries.
+*   🚀 **Thread-Safe Forward Star Engine (`GraphStore`)**: Contiguous primitive arrays (`_head`, `_to`, `_relation`, `_next`, `_weights`) protected by `ReaderWriterLockSlim` prevent torn `Array.Resize` reads under concurrent ingestion and querying.
+*   🗜️ **Weighted CSR Memory-Mapped & Out-of-Core Execution (`CsrGraphStore`)**: Compile graphs into the compact **`GCSR` v2** format storing row offsets, column indices, relation IDs, node metadata, and `float` edge weights—queried either via zero-copy `MemoryMappedFile` spans or a strictly bounded 64-bit LRU 4 KB software page cache (`maxMemoryBytes`).
+*   🧮 **SIMD Hardware Intrinsics (`CsrKernels`)**: Vectorized neighbor scanning, bitmask index extraction, degree subtraction, and set intersection using `Vector512` (AVX-512), `Vector256` (AVX2), and `Vector128` (SSE/AdvSIMD).
+*   💾 **Compact Binary Persistence (`GLGR` v2)**: Serializes only active node and edge slots via `MemoryMarshal.AsBytes` with strict header and truncated-file validation (`InvalidDataException`).
+*   🤖 **100% Native AOT MCP Server (`GraphMcpServer`)**: Source-generated `System.Text.Json` (`GraphMcpJsonContext`) JSON-RPC 2.0 server over UTF-8 stdio with atomic state swapping and opt-in `stderr` diagnostics (`GLACIER_GRAPH_MCP_DEBUG=1`).
 
 ---
 
@@ -54,85 +54,80 @@ dotnet add package Glacier.Graph
 
 ## Quick Start
 
-### 1. Initialize the Graph Store
+### 1. Initialize the Graph Store & Add Weighted Edges
 
 ```csharp
 using Glacier.Graph.Storage;
 using Glacier.Graph.Traversal;
 
-// Instantiate the GC-optimized graph store
-var store = new GraphStore(initialNodeCapacity: 100_000, initialEdgeCapacity: 500_000);
-```
+using var store = new GraphStore(initialNodeCapacity: 100_000, initialEdgeCapacity: 500_000);
 
-### 2. Add Nodes and Edges
-
-```csharp
-// Add nodes and define metadata
 store.AddNode("User_1", "Developer");
 store.AddNode("User_2", "Manager");
 
-// Create directed relationships
-store.AddEdge("User_1", "User_2", "REPORTS_TO");
-store.AddEdge("User_2", "User_3", "KNOWS");
+// Create directed relationships with optional non-negative weights (>= 0.0f)
+store.AddEdge("User_1", "User_3", "DIRECT_ROUTE", weight: 5.0f);
+store.AddEdge("User_1", "User_2", "REPORTS_TO", weight: 0.2f);
+store.AddEdge("User_2", "User_3", "KNOWS", weight: 0.2f);
 ```
 
-### 3. Traversal and Path Finding
+### 2. Unweighted BFS, Weighted Dijkstra, & K-Hop Neighborhoods
 
 ```csharp
 var search = new GraphSearch(store);
 
-// Find the shortest path using ultra-fast BFS
-List<string> path = search.FindShortestPath("User_1", "User_3");
-Console.WriteLine($"Path: {string.Join(" -> ", path)}");
-// Output: Path: User_1 -> User_2 -> User_3
+// Unweighted BFS (fewest hops: User_1 -> User_3)
+List<string> bfsPath = search.FindShortestPath("User_1", "User_3");
 
-// Find all neighbors within a 2-hop radius
+// Weighted Dijkstra (lowest total weight 0.4 < 5.0: User_1 -> User_2 -> User_3)
+List<string> weightedPath = search.FindShortestPathDijkstra("User_1", "User_3");
+
+// Pure zero-allocation Span<int> query path
+Span<int> pathBuffer = stackalloc int[64];
+int length = search.FindShortestPathDijkstra(1, 3, pathBuffer);
+
+// Discover all neighbors within 2 hops
 List<string> neighbors = search.FindNeighborhood("User_1", maxHops: 2);
-Console.WriteLine($"Neighbors: {string.Join(", ", neighbors)}");
 ```
 
-### 4. RAM-to-Disk Serialization
+### 3. Compact RAM-to-Disk Serialization
 
 ```csharp
-// Save the raw arrays directly to disk (GLGR binary schema)
+// Persist active graph slots directly to disk (GLGR v2 binary schema)
 store.SaveToDisk("graph_database.bin");
 
-// Instantly restore and revive the graph database on startup
-GraphStore loadedStore = GraphStore.LoadFromDisk("graph_database.bin");
+// Restore and validate graph database
+using GraphStore loadedStore = GraphStore.LoadFromDisk("graph_database.bin");
 ```
 
-### 5. Out-of-Core Execution (Memory Constrained Environments)
-
-For embedded devices with strictly limited RAM (e.g., 256KB), you can compile the graph into a **Compressed Sparse Row (CSR)** format. This format is heavily optimized for sequential reads from disk/flash storage without relying on unpredictable OS paging.
+### 4. Memory-Mapped & Out-of-Core Weighted CSR Execution
 
 ```csharp
-// Compile the dynamic Forward Star graph into a static CSR binary format
+// Compile Forward Star topology + metadata + weights into compact GCSR v2 format
 CsrGraphCompiler.CompileFromForwardStar(store, "graph_database.csr");
 
-// Load the graph with a strict maximum memory limit (e.g., 256 KB)
-// The engine handles LRU page caching internally to prevent out-of-memory errors!
-using var csrStore = new CsrGraphStore("graph_database.csr", maxMemoryBytes: 256 * 1024);
-var csrSearch = new CsrGraphSearch(csrStore);
+// Option A: High-throughput Memory-Mapped File (zero-copy Span<int> / Span<float> access)
+using var csrMmf = new CsrGraphStore("graph_database.csr", useMemoryMapping: true);
+var csrSearch = new CsrGraphSearch(csrMmf);
+List<string> optimal = csrSearch.FindShortestPathDijkstra("User_1", "User_3");
 
-// Perform traversal perfectly constrained to the 256KB limit
-List<string> path = csrSearch.FindShortestPath("User_1", "User_99999");
+// Option B: Strictly bounded 256 KB software LRU page cache for constrained hardware
+using var csrPaged = new CsrGraphStore("graph_database.csr", maxMemoryBytes: 256 * 1024, useMemoryMapping: false);
 ```
 
 ---
 
 ## MCP Server Setup
 
-Glacier.Graph contains a dedicated MCP (Model Context Protocol) server runner. This allows AI clients (like Claude Desktop or developer agents) to query, insert, and navigate the graph in real-time.
+Glacier.Graph includes a Native AOT-ready MCP (Model Context Protocol) server runner allowing AI clients (such as Claude Desktop or Antigravity) to query, mutate, and persist graphs in real time.
 
-### 1. Compile the Host Runner
-Build the runner console application in Release mode:
+### 1. Build the Host Runner
 
 ```bash
 dotnet build src/Glacier.Graph.Host/Glacier.Graph.Host.csproj -c Release
 ```
 
 ### 2. Configure Your Client
-Add the following entry to your `mcp_config.json` (usually located in your agent's config directory, or `%AppData%\Roaming\Claude\claude_desktop_config.json`):
 
 ```json
 {
@@ -141,7 +136,7 @@ Add the following entry to your `mcp_config.json` (usually located in your agent
       "command": "dotnet",
       "args": [
         "ABS_PATH_TO_REPO/src/Glacier.Graph.Host/bin/Release/net10.0/Glacier.Graph.Host.dll",
-        "ABS_PATH_TO_REPO/graph_database.bin"
+        "ABS_PATH_TO_DATA/graph_database.bin"
       ]
     }
   }
@@ -150,43 +145,34 @@ Add the following entry to your `mcp_config.json` (usually located in your agent
 
 ### 3. Exposed MCP Tools
 
-*   **`ping`**: Simple health check to verify server responsiveness.
+*   **`ping`**: Health check returning `"pong"`.
 *   **`add_node`**: Registers or updates a node and its metadata.
-*   **`add_edge`**: Links two nodes with a typed relationship.
-*   **`find_shortest_path`**: Computes the shortest sequence of nodes connecting two IDs.
-*   **`find_neighborhood`**: Discovers all neighbors within a specified hop distance.
-*   **`save_graph`**: Persists active memory arrays to a disk file.
-*   **`load_graph`**: Replaces the active memory database with a persisted disk file.
+*   **`add_edge`**: Links two nodes with a typed relationship and optional `weight`.
+*   **`find_shortest_path`**: Computes shortest path via BFS or weighted Dijkstra (`"weighted": true`).
+*   **`find_neighborhood`**: Discovers all neighbors within `maxHops`.
+*   **`save_graph`** / **`load_graph`**: Atomically persists or reloads graph snapshots from disk.
 
 ---
 
-## Architecture Overview
+## Architecture Documentation
 
-1.  **Forward Star Storage**: Contiguous arrays `_head`, `_to`, `_relation`, and `_next` manage relations safely inside primitive integer indices.
-2.  **GC Bypass**: De-allocates traditional object-oriented object nodes, leveraging standard struct `EdgeEnumerator` loops to walk paths.
-3.  **Flat Array Tracking**: Traversal algorithms leverage flat `bool[]` arrays pre-sized to Node Capacity to eliminate hash-set map collisions during hops.
-4.  **BOM-Free Connection**: The stdio channel enforces standard UTF-8 stream writer loops (without Byte Order Marks) to ensure smooth communication with Node-based MCP orchestrators.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for an in-depth technical breakdown of the Forward Star and `GCSR` v2 binary layouts, concurrency model, `TraversalScratchWorkspace` generation tagging, SIMD kernels, and Native AOT MCP pipeline.
+
+---
+
+## 🆕 What's New in v1.1.0
+
+- **Weighted CSR v2 Format & Real CSR Dijkstra** — `CsrGraphCompiler` and `CsrGraphStore` now persist, memory-map, and page per-edge `float` weights (`GCSR` v2 while retaining `v1` read compatibility), powering true weighted `CsrGraphSearch.FindShortestPathDijkstra` including `0.0f` zero-cost edges.
+- **Full Concurrency Safety & Compact Serialization** — `GraphStore` (`IDisposable`), `GraphSearch`, and `CsrGraphCompiler` now synchronize read/write scopes across `Array.Resize` mutations with atomic `EdgeEnumerator` snapshots, and eliminate empty capacity bloat when saving `.bin` and `.csr` files.
+- **Hardened CSR Bounds & Truncated-File Validation** — Strict header/offset/length validation (`InvalidDataException`), safe out-of-bounds internal ID handling, partial EOF page zeroing, and 64-bit `long` LRU access counters.
+- **100% Native AOT Compliance (`<IsAotCompatible>true</IsAotCompatible>`)** — `GraphMcpServer` refactored to source-generated `GraphMcpJsonContext` DTOs, atomic store swapping, and opt-in `stderr` logging (`GLACIER_GRAPH_MCP_DEBUG`).
+- **48 unit & adversarial stress tests** passing with `0` warnings and `0` transitive vulnerabilities.
 
 ---
 
 ## Contributing
 
-We welcome community contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for local setups, branch models, and PR checklist details.
-
-## 🆕 What's New in v1.0.5
-
-- **True Zero-Allocation CSR Traversal (`TraversalScratchWorkspace`)** — Eliminated all dynamic heap allocations (`Queue<int>`, `HashSet<int>`, `PriorityQueue<int, float>`, `bool[]`) in BFS, DFS, Dijkstra, Neighborhood, and Triplet traversals via pooled scratch arrays and generation tagging (0 GC bytes allocated on hot paths).
-- **AVX-512 SIMD CSR Kernels (`CsrKernels`)** — Vectorized neighbor scanning, degree computations, and intersection operations with up to 125x acceleration.
-- **`Glacier.Graph.Benchmarks` Suite** — BenchmarkDotNet suite profiling sparse CSR graph traversals and hardware SIMD kernels.
-- **39 unit tests** passing (100% green).
-
----
-
-## 🆕 What's New in v1.0.4
-
-- **CSR Forward Star storage** — pure array-backed graph representation with zero GC allocations per traversal operation.
-- **Parallel BFS/DFS and Dijkstra shortest-path** — multi-threaded traversal exploiting all available CPU cores.
-- **Full test suite authored from scratch** — **14 tests** covering traversal correctness, serialization, and MCP integration.
+We welcome community contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for local setup and PR guidelines.
 
 ## Credits
 

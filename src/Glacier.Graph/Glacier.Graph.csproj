@@ -2,10 +2,32 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.5</Version>
+    <IsAotCompatible>true</IsAotCompatible>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+
+    <!-- NuGet Package Metadata -->
+    <PackageId>Glacier.Graph</PackageId>
+    <Version>1.1.0</Version>
+    <Authors>Ian Cowley</Authors>
+    <Company>Glacier High-Performance Ecosystem</Company>
+    <Description>Zero-allocation Forward Star and memory-mapped Compressed Sparse Row (CSR) graph database, SIMD AVX-512 traversal engine, weighted Dijkstra pathfinding, and Native AOT MCP server for .NET 10.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Graph</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Graph</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>graph;csr;forward-star;simd;avx512;dijkstra;bfs;zero-allocation;mcp;native-aot;dotnet10;glacier</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <InternalsVisibleTo Include="Glacier.Graph.Tests" />
+  </ItemGroup>
 
 </Project>

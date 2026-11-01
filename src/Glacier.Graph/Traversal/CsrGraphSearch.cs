@@ -6,7 +6,7 @@ using Glacier.Graph.Storage;
 
 /// <summary>
 /// High-performance traversal algorithms for <see cref="CsrGraphStore"/>.
-/// Operates directly over memory-mapped contiguous column index spans or software-paged cache
+/// Operates directly over memory-mapped contiguous column index and weight spans or software-paged cache
 /// using pooled scratch arrays and O(1) generation tagging (<see cref="TraversalScratchWorkspace"/>)
 /// to achieve zero GC heap allocations during traversals.
 /// </summary>
@@ -68,7 +68,7 @@ public class CsrGraphSearch
                 for (int i = 0; i < neighbors.Length; i++)
                 {
                     int neighbor = neighbors[i];
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Parent[neighbor] = current;
@@ -82,7 +82,7 @@ public class CsrGraphSearch
                 while (edges.MoveNext())
                 {
                     int neighbor = edges.CurrentTargetNodeId;
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Parent[neighbor] = current;
@@ -123,6 +123,9 @@ public class CsrGraphSearch
     /// </summary>
     public List<string> FindShortestPath(string startId, string targetId)
     {
+        ArgumentNullException.ThrowIfNull(startId);
+        ArgumentNullException.ThrowIfNull(targetId);
+
         int startInternal = _store.GetExternalToInternalId(startId);
         int targetInternal = _store.GetExternalToInternalId(targetId);
 
@@ -155,7 +158,7 @@ public class CsrGraphSearch
                 for (int i = 0; i < neighbors.Length; i++)
                 {
                     int neighbor = neighbors[i];
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Parent[neighbor] = current;
@@ -169,7 +172,7 @@ public class CsrGraphSearch
                 while (edges.MoveNext())
                 {
                     int neighbor = edges.CurrentTargetNodeId;
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Parent[neighbor] = current;
@@ -252,7 +255,7 @@ public class CsrGraphSearch
                 for (int i = 0; i < neighbors.Length; i++)
                 {
                     int neighbor = neighbors[i];
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Parent[neighbor] = current;
@@ -266,7 +269,7 @@ public class CsrGraphSearch
                 while (edges.MoveNext())
                 {
                     int neighbor = edges.CurrentTargetNodeId;
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Parent[neighbor] = current;
@@ -305,6 +308,9 @@ public class CsrGraphSearch
     /// </summary>
     public List<string> FindPathDfs(string startId, string targetId)
     {
+        ArgumentNullException.ThrowIfNull(startId);
+        ArgumentNullException.ThrowIfNull(targetId);
+
         int startInternal = _store.GetExternalToInternalId(startId);
         int targetInternal = _store.GetExternalToInternalId(targetId);
 
@@ -337,7 +343,7 @@ public class CsrGraphSearch
                 for (int i = 0; i < neighbors.Length; i++)
                 {
                     int neighbor = neighbors[i];
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Parent[neighbor] = current;
@@ -351,7 +357,7 @@ public class CsrGraphSearch
                 while (edges.MoveNext())
                 {
                     int neighbor = edges.CurrentTargetNodeId;
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Parent[neighbor] = current;
@@ -387,7 +393,8 @@ public class CsrGraphSearch
     }
 
     /// <summary>
-    /// Finds the shortest path between two nodes using Dijkstra's algorithm.
+    /// Finds the weighted shortest path between two nodes using Dijkstra's algorithm over CSR edge weights.
+    /// Supports non-negative edge weights (<c>&gt;= 0.0f</c>) and throws <see cref="InvalidOperationException"/> on negative weights.
     /// Pure zero-allocation query path.
     /// </summary>
     public int FindShortestPathDijkstra(int startInternalId, int targetInternalId, Span<int> pathBuffer, TraversalScratchWorkspace? workspace = null)
@@ -429,15 +436,21 @@ public class CsrGraphSearch
                 break;
             }
 
-            if (_store.TryGetNeighbors(current, out var neighbors))
+            if (_store.TryGetNeighborsAndWeights(current, out var neighbors, out var weights))
             {
                 for (int i = 0; i < neighbors.Length; i++)
                 {
                     int neighbor = neighbors[i];
-                    float weight = 1.0f; // CSR unit weight default
+                    float weight = weights[i];
+                    if (weight < 0f || float.IsNaN(weight) || float.IsInfinity(weight))
+                    {
+                        throw new InvalidOperationException(
+                            $"Dijkstra's algorithm requires finite non-negative edge weights, but encountered {weight}.");
+                    }
+
                     float newDist = curDist + weight;
 
-                    if (neighbor <= nodeCount)
+                    if (neighbor > 0 && neighbor <= nodeCount)
                     {
                         if (!ws.IsVisited(neighbor) || newDist < ws.Distances[neighbor])
                         {
@@ -455,10 +468,16 @@ public class CsrGraphSearch
                 while (edges.MoveNext())
                 {
                     int neighbor = edges.CurrentTargetNodeId;
-                    float weight = 1.0f;
+                    float weight = edges.CurrentWeight;
+                    if (weight < 0f || float.IsNaN(weight) || float.IsInfinity(weight))
+                    {
+                        throw new InvalidOperationException(
+                            $"Dijkstra's algorithm requires finite non-negative edge weights, but encountered {weight}.");
+                    }
+
                     float newDist = curDist + weight;
 
-                    if (neighbor <= nodeCount)
+                    if (neighbor > 0 && neighbor <= nodeCount)
                     {
                         if (!ws.IsVisited(neighbor) || newDist < ws.Distances[neighbor])
                         {
@@ -497,10 +516,14 @@ public class CsrGraphSearch
     }
 
     /// <summary>
-    /// Finds the shortest path between two nodes using Dijkstra's algorithm.
+    /// Finds the weighted shortest path between two nodes using Dijkstra's algorithm over CSR edge weights.
+    /// Supports non-negative edge weights (<c>&gt;= 0.0f</c>) and throws <see cref="InvalidOperationException"/> on negative weights.
     /// </summary>
     public List<string> FindShortestPathDijkstra(string startId, string targetId)
     {
+        ArgumentNullException.ThrowIfNull(startId);
+        ArgumentNullException.ThrowIfNull(targetId);
+
         int startInternal = _store.GetExternalToInternalId(startId);
         int targetInternal = _store.GetExternalToInternalId(targetId);
 
@@ -529,15 +552,21 @@ public class CsrGraphSearch
                 break;
             }
 
-            if (_store.TryGetNeighbors(current, out var neighbors))
+            if (_store.TryGetNeighborsAndWeights(current, out var neighbors, out var weights))
             {
                 for (int i = 0; i < neighbors.Length; i++)
                 {
                     int neighbor = neighbors[i];
-                    float weight = 1.0f;
+                    float weight = weights[i];
+                    if (weight < 0f || float.IsNaN(weight) || float.IsInfinity(weight))
+                    {
+                        throw new InvalidOperationException(
+                            $"Dijkstra's algorithm requires finite non-negative edge weights, but encountered {weight}.");
+                    }
+
                     float newDist = curDist + weight;
 
-                    if (neighbor <= nodeCount)
+                    if (neighbor > 0 && neighbor <= nodeCount)
                     {
                         if (!ws.IsVisited(neighbor) || newDist < ws.Distances[neighbor])
                         {
@@ -555,10 +584,16 @@ public class CsrGraphSearch
                 while (edges.MoveNext())
                 {
                     int neighbor = edges.CurrentTargetNodeId;
-                    float weight = 1.0f;
+                    float weight = edges.CurrentWeight;
+                    if (weight < 0f || float.IsNaN(weight) || float.IsInfinity(weight))
+                    {
+                        throw new InvalidOperationException(
+                            $"Dijkstra's algorithm requires finite non-negative edge weights, but encountered {weight}.");
+                    }
+
                     float newDist = curDist + weight;
 
-                    if (neighbor <= nodeCount)
+                    if (neighbor > 0 && neighbor <= nodeCount)
                     {
                         if (!ws.IsVisited(neighbor) || newDist < ws.Distances[neighbor])
                         {
@@ -637,7 +672,7 @@ public class CsrGraphSearch
                 for (int i = 0; i < neighbors.Length; i++)
                 {
                     int neighbor = neighbors[i];
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Distance[neighbor] = currentDist + 1;
@@ -651,7 +686,7 @@ public class CsrGraphSearch
                 while (edges.MoveNext())
                 {
                     int neighbor = edges.CurrentTargetNodeId;
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Distance[neighbor] = currentDist + 1;
@@ -670,6 +705,9 @@ public class CsrGraphSearch
     /// </summary>
     public List<string> FindNeighborhood(string sourceId, int maxHops)
     {
+        ArgumentNullException.ThrowIfNull(sourceId);
+        if (maxHops <= 0) return new List<string>();
+
         int startInternal = _store.GetExternalToInternalId(sourceId);
         if (startInternal == 0) return new List<string>();
 
@@ -701,7 +739,7 @@ public class CsrGraphSearch
                 for (int i = 0; i < neighbors.Length; i++)
                 {
                     int neighbor = neighbors[i];
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Distance[neighbor] = currentDist + 1;
@@ -715,7 +753,7 @@ public class CsrGraphSearch
                 while (edges.MoveNext())
                 {
                     int neighbor = edges.CurrentTargetNodeId;
-                    if (neighbor <= nodeCount && !ws.IsVisited(neighbor))
+                    if (neighbor > 0 && neighbor <= nodeCount && !ws.IsVisited(neighbor))
                     {
                         ws.SetVisited(neighbor);
                         ws.Distance[neighbor] = currentDist + 1;

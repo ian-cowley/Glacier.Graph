@@ -16,6 +16,14 @@
 *.DotSettings.user
 *.DotSettings
 
+# Secrets and local configuration (Zero Secrets Policy)
+appsettings*.json
+!appsettings.template.json
+*.env*
+*.pfx
+*.pem
+*.key
+
 # AI assistant artifacts
 .gemini/
 
@@ -24,16 +32,21 @@ BenchmarkDotNet.Artifacts/
 
 # NuGet
 *.nupkg
+*.snupkg
 packages/
 
-# Database and heavy files (Crucial to block heavy arrays from git)
+# Database and binary graph files
 *.bin
+*.csr
+*.gcsr
 graph_database.bin
+graph_database.csr
 temp_graph_database.bin
 
 # Logs
 *.log
 mcp_log.txt
+graph_mcp_log.txt
 ncrunch*
 
 # OS files
