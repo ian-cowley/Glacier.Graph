@@ -290,6 +290,12 @@ namespace Glacier.Graph.Storage
             return _externalToInternalId.TryGetValue(externalId, out int val) ? val : 0;
         }
 
+        public bool TryGetInternalId(string externalId, out int internalId)
+        {
+            ArgumentNullException.ThrowIfNull(externalId);
+            return _externalToInternalId.TryGetValue(externalId, out internalId);
+        }
+
         public string GetExternalId(int internalId)
             => _internalToExternalId.TryGetValue(internalId, out string? val) && val != null ? val : string.Empty;
 

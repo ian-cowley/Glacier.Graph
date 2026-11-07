@@ -396,4 +396,338 @@ public static class CsrKernels
         }
         return count;
     }
+
+    // =========================================================================
+    // 4. HIPPORAG SPARSE CSR SPMV PERSONALIZED PAGERANK
+    // =========================================================================
+
+    /// <summary>
+    /// Executes hardware-accelerated (Vector512 / AVX-512) Sparse Matrix-Vector (SpMV)
+    /// Personalized PageRank (HippoRAG) over the CSR graph topology.
+    /// Eliminates pairwise BFS loops with an O(k * |E|) power iteration pass.
+    /// </summary>
+    /// <param name="graph">The CSR graph store containing contiguous row offsets, column indices, and edge weights.</param>
+    /// <param name="seedEntities">The 1-based internal IDs of the seed entities.</param>
+    /// <param name="seedWeights">Optional initial probability weights for the seed entities (uniform if empty).</param>
+    /// <param name="pprScoresOut">Destination span of length at least graph.NodeCount + 1 to receive stationary PPR scores.</param>
+    /// <param name="alpha">Damping/continuation probability factor (typically 0.85f).</param>
+    /// <param name="maxIterations">Maximum number of power iteration steps (typically 20).</param>
+    /// <param name="tolerance">L1 norm convergence threshold (typically 1e-6f).</param>
+    public static void PersonalizedPageRank(
+        Glacier.Graph.Storage.CsrGraphStore graph,
+        ReadOnlySpan<int> seedEntities,
+        ReadOnlySpan<float> seedWeights,
+        Span<float> pprScoresOut,
+        float alpha = 0.85f,
+        int maxIterations = 20,
+        float tolerance = 1e-6f)
+    {
+        ArgumentNullException.ThrowIfNull(graph);
+
+        ReadOnlySpan<int> rowOffsets = graph.GetRowOffsetsSpan();
+        ReadOnlySpan<int> columnIndices = graph.GetColumnIndicesSpan();
+        ReadOnlySpan<float> edgeWeights = graph.GetEdgeWeightsSpan();
+
+        if (!rowOffsets.IsEmpty && !columnIndices.IsEmpty)
+        {
+            PersonalizedPageRank(
+                rowOffsets,
+                columnIndices,
+                edgeWeights,
+                graph.NodeCount,
+                seedEntities,
+                seedWeights,
+                pprScoresOut,
+                alpha,
+                maxIterations,
+                tolerance);
+            return;
+        }
+
+        // Fallback for non-memory-mapped access
+        int nodeCount = graph.NodeCount;
+        if (nodeCount <= 0) return;
+        if (pprScoresOut.Length < nodeCount + 1)
+            throw new ArgumentException($"pprScoresOut length ({pprScoresOut.Length}) must be >= NodeCount + 1 ({nodeCount + 1}).");
+
+        int[] dynamicRowOffsets = new int[nodeCount + 2];
+        System.Collections.Generic.List<int> dynamicColIndices = new(graph.EdgeCount);
+        System.Collections.Generic.List<float> dynamicWeights = new(graph.EdgeCount);
+
+        for (int u = 1; u <= nodeCount; u++)
+        {
+            dynamicRowOffsets[u] = dynamicColIndices.Count;
+            if (graph.TryGetNeighborsAndWeights(u, out var nbrs, out var wts))
+            {
+                for (int e = 0; e < nbrs.Length; e++)
+                {
+                    dynamicColIndices.Add(nbrs[e]);
+                    dynamicWeights.Add(e < wts.Length ? wts[e] : 1.0f);
+                }
+            }
+            else if (graph.TryGetNeighbors(u, out var nbrsOnly))
+            {
+                for (int e = 0; e < nbrsOnly.Length; e++)
+                {
+                    dynamicColIndices.Add(nbrsOnly[e]);
+                    dynamicWeights.Add(1.0f);
+                }
+            }
+        }
+        dynamicRowOffsets[nodeCount + 1] = dynamicColIndices.Count;
+
+        PersonalizedPageRank(
+            dynamicRowOffsets,
+            CollectionsMarshal.AsSpan(dynamicColIndices),
+            CollectionsMarshal.AsSpan(dynamicWeights),
+            nodeCount,
+            seedEntities,
+            seedWeights,
+            pprScoresOut,
+            alpha,
+            maxIterations,
+            tolerance);
+    }
+
+    /// <summary>
+    /// Primitive span-based overload for CSR data structures in memory.
+    /// </summary>
+    public static void PersonalizedPageRank(
+        ReadOnlySpan<int> rowOffsets,
+        ReadOnlySpan<int> columnIndices,
+        ReadOnlySpan<float> edgeWeights,
+        int nodeCount,
+        ReadOnlySpan<int> seedEntities,
+        ReadOnlySpan<float> seedWeights,
+        Span<float> pprScoresOut,
+        float alpha = 0.85f,
+        int maxIterations = 20,
+        float tolerance = 1e-6f)
+    {
+        if (nodeCount <= 0) return;
+        if (rowOffsets.Length < nodeCount + 2)
+            throw new ArgumentException("rowOffsets length must be >= nodeCount + 2.");
+        if (pprScoresOut.Length < nodeCount + 1)
+            throw new ArgumentException("pprScoresOut length must be >= nodeCount + 1.");
+
+        pprScoresOut.Clear();
+
+        float[]? rentedP0 = null;
+        float[]? rentedPCurr = null;
+        float[]? rentedPNext = null;
+        float[]? rentedInvOut = null;
+        bool[]? rentedDangling = null;
+
+        int bufSize = nodeCount + 1;
+        Span<float> p0 = bufSize <= 1024 ? stackalloc float[bufSize] : (rentedP0 = System.Buffers.ArrayPool<float>.Shared.Rent(bufSize)).AsSpan(0, bufSize);
+        Span<float> pCurr = bufSize <= 1024 ? stackalloc float[bufSize] : (rentedPCurr = System.Buffers.ArrayPool<float>.Shared.Rent(bufSize)).AsSpan(0, bufSize);
+        Span<float> pNext = bufSize <= 1024 ? stackalloc float[bufSize] : (rentedPNext = System.Buffers.ArrayPool<float>.Shared.Rent(bufSize)).AsSpan(0, bufSize);
+        Span<float> invOut = bufSize <= 1024 ? stackalloc float[bufSize] : (rentedInvOut = System.Buffers.ArrayPool<float>.Shared.Rent(bufSize)).AsSpan(0, bufSize);
+        Span<bool> isDangling = bufSize <= 1024 ? stackalloc bool[bufSize] : (rentedDangling = new bool[bufSize]).AsSpan(0, bufSize);
+
+        try
+        {
+            p0.Clear();
+            invOut.Clear();
+            isDangling.Clear();
+
+            // 1. Initialize personalization vector p0
+            float totalSeedWeight = 0f;
+
+            for (int s = 0; s < seedEntities.Length; s++)
+            {
+                int u = seedEntities[s];
+                if (u >= 1 && u <= nodeCount)
+                {
+                    float w = (s < seedWeights.Length && seedWeights[s] > 0f) ? seedWeights[s] : 1.0f;
+                    p0[u] += w;
+                    totalSeedWeight += w;
+                }
+            }
+
+            if (totalSeedWeight > 0f)
+            {
+                float invSum = 1.0f / totalSeedWeight;
+                for (int u = 1; u <= nodeCount; u++)
+                {
+                    if (p0[u] > 0f)
+                    {
+                        p0[u] *= invSum;
+                    }
+                }
+            }
+            else
+            {
+                float uniform = 1.0f / nodeCount;
+                for (int u = 1; u <= nodeCount; u++)
+                {
+                    p0[u] = uniform;
+                }
+            }
+
+            p0.CopyTo(pCurr);
+
+            // 2. Precompute out-degrees and inverse weights
+            bool hasWeights = !edgeWeights.IsEmpty;
+            for (int u = 1; u <= nodeCount; u++)
+            {
+                int start = rowOffsets[u];
+                int end = rowOffsets[u + 1];
+                int degree = end - start;
+
+                if (degree <= 0)
+                {
+                    isDangling[u] = true;
+                    invOut[u] = 0f;
+                }
+                else if (!hasWeights)
+                {
+                    invOut[u] = 1.0f / degree;
+                }
+                else
+                {
+                    float wSum = 0f;
+                    for (int k = start; k < end; k++)
+                    {
+                        wSum += edgeWeights[k];
+                    }
+                    if (wSum > 0f)
+                    {
+                        invOut[u] = 1.0f / wSum;
+                    }
+                    else
+                    {
+                        isDangling[u] = true;
+                        invOut[u] = 0f;
+                    }
+                }
+            }
+
+            // 3. Power Iteration with Dangling Node Redistribution
+            ref float p0Ref = ref MemoryMarshal.GetReference(p0);
+            ref float pCurrRef = ref MemoryMarshal.GetReference(pCurr);
+            ref float pNextRef = ref MemoryMarshal.GetReference(pNext);
+
+            for (int iter = 0; iter < maxIterations; iter++)
+            {
+                // A. Compute trapped dangling mass
+                float mDangle = 0f;
+                for (int u = 1; u <= nodeCount; u++)
+                {
+                    if (isDangling[u])
+                    {
+                        mDangle += pCurr[u];
+                    }
+                }
+
+                float sDangle = (1.0f - alpha) + (alpha * mDangle);
+
+                // B. Initialize pNext with teleport contribution S_dangle * p0 (Vectorized)
+                int i = 1;
+                if (Vector512.IsHardwareAccelerated && (nodeCount - i + 1) >= Vector512<float>.Count)
+                {
+                    var vS = Vector512.Create(sDangle);
+                    int limit = nodeCount - Vector512<float>.Count + 1;
+                    for (; i <= limit; i += Vector512<float>.Count)
+                    {
+                        var vP0 = Vector512.LoadUnsafe(ref p0Ref, (nuint)i);
+                        (vS * vP0).StoreUnsafe(ref pNextRef, (nuint)i);
+                    }
+                }
+                if (Vector256.IsHardwareAccelerated && (nodeCount - i + 1) >= Vector256<float>.Count)
+                {
+                    var vS = Vector256.Create(sDangle);
+                    int limit = nodeCount - Vector256<float>.Count + 1;
+                    for (; i <= limit; i += Vector256<float>.Count)
+                    {
+                        var vP0 = Vector256.LoadUnsafe(ref p0Ref, (nuint)i);
+                        (vS * vP0).StoreUnsafe(ref pNextRef, (nuint)i);
+                    }
+                }
+                for (; i <= nodeCount; i++)
+                {
+                    pNext[i] = sDangle * p0[i];
+                }
+
+                // C. Sparse CSR SpMV transition
+                for (int u = 1; u <= nodeCount; u++)
+                {
+                    if (isDangling[u]) continue;
+
+                    float pVal = pCurr[u];
+                    if (pVal == 0f) continue;
+
+                    float coeff = alpha * pVal * invOut[u];
+                    int start = rowOffsets[u];
+                    int end = rowOffsets[u + 1];
+
+                    if (!hasWeights)
+                    {
+                        for (int k = start; k < end; k++)
+                        {
+                            int v = columnIndices[k];
+                            pNext[v] += coeff;
+                        }
+                    }
+                    else
+                    {
+                        for (int k = start; k < end; k++)
+                        {
+                            int v = columnIndices[k];
+                            pNext[v] += coeff * edgeWeights[k];
+                        }
+                    }
+                }
+
+                // D. Check L1 convergence (Vectorized)
+                float delta = 0f;
+                int j = 1;
+                if (Vector512.IsHardwareAccelerated && (nodeCount - j + 1) >= Vector512<float>.Count)
+                {
+                    var vDelta = Vector512<float>.Zero;
+                    int limit = nodeCount - Vector512<float>.Count + 1;
+                    for (; j <= limit; j += Vector512<float>.Count)
+                    {
+                        var vNext = Vector512.LoadUnsafe(ref pNextRef, (nuint)j);
+                        var vCurr = Vector512.LoadUnsafe(ref pCurrRef, (nuint)j);
+                        vDelta += Vector512.Abs(vNext - vCurr);
+                    }
+                    delta += Vector512.Sum(vDelta);
+                }
+                if (Vector256.IsHardwareAccelerated && (nodeCount - j + 1) >= Vector256<float>.Count)
+                {
+                    var vDelta = Vector256<float>.Zero;
+                    int limit = nodeCount - Vector256<float>.Count + 1;
+                    for (; j <= limit; j += Vector256<float>.Count)
+                    {
+                        var vNext = Vector256.LoadUnsafe(ref pNextRef, (nuint)j);
+                        var vCurr = Vector256.LoadUnsafe(ref pCurrRef, (nuint)j);
+                        vDelta += Vector256.Abs(vNext - vCurr);
+                    }
+                    delta += Vector256.Sum(vDelta);
+                }
+                for (; j <= nodeCount; j++)
+                {
+                    delta += MathF.Abs(pNext[j] - pCurr[j]);
+                }
+
+                // Swap buffers for next iteration
+                pNext.CopyTo(pCurr);
+
+                if (delta < tolerance)
+                {
+                    break;
+                }
+            }
+
+            pCurr.Slice(0, nodeCount + 1).CopyTo(pprScoresOut);
+        }
+        finally
+        {
+            if (rentedP0 != null) System.Buffers.ArrayPool<float>.Shared.Return(rentedP0);
+            if (rentedPCurr != null) System.Buffers.ArrayPool<float>.Shared.Return(rentedPCurr);
+            if (rentedPNext != null) System.Buffers.ArrayPool<float>.Shared.Return(rentedPNext);
+            if (rentedInvOut != null) System.Buffers.ArrayPool<float>.Shared.Return(rentedInvOut);
+        }
+    }
 }
