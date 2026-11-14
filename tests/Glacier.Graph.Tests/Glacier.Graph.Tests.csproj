@@ -22,6 +22,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Glacier.Graph\Glacier.Graph.csproj" />
+    <ProjectReference Include="..\..\src\Glacier.Graph.Host\Glacier.Graph.Host.csproj" />
   </ItemGroup>
 
 </Project>
