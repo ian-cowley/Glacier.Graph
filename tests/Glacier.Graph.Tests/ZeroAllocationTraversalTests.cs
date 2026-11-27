@@ -139,12 +139,15 @@ public class ZeroAllocationTraversalTests : IDisposable
 
         var search = new GraphSearch(store);
 
-        // Warmup: primes ThreadStatic workspace and JIT-compiles methods
+        // Warmup: primes ThreadStatic workspace and promotes Tier0 -> Tier1 JIT before allocation measurement
         Span<int> pathBuffer = stackalloc int[256];
-        _ = search.FindShortestPath(1, 150, pathBuffer);
-        _ = search.FindPathDfs(1, 150, pathBuffer);
-        _ = search.FindShortestPathDijkstra(1, 150, pathBuffer);
-        _ = search.FindNeighborhood(1, maxHops: 4, pathBuffer);
+        for (int w = 0; w < 64; w++)
+        {
+            _ = search.FindShortestPath(1, 150, pathBuffer);
+            _ = search.FindPathDfs(1, 150, pathBuffer);
+            _ = search.FindShortestPathDijkstra(1, 150, pathBuffer);
+            _ = search.FindNeighborhood(1, maxHops: 4, pathBuffer);
+        }
 
         // 1. BFS Shortest Path - Pure Zero-Allocation Verification
         int pathLen = search.FindShortestPath(1, 100, pathBuffer);
