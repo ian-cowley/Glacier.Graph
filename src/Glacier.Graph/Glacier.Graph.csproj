@@ -13,7 +13,8 @@
 
     <!-- NuGet Package Metadata -->
     <PackageId>Glacier.Graph</PackageId>
-    <Version>1.2.0</Version>
+    <Version>1.2.1</Version>
+    <PackageReleaseNotes>v1.2.1: Atomic temp+fsync persistence, ReaderWriterLockSlim read concurrency in GraphMcpServer, and path containment checks.</PackageReleaseNotes>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Zero-allocation Forward Star and memory-mapped Compressed Sparse Row (CSR) graph database, SIMD AVX-512 traversal engine, weighted Dijkstra pathfinding, and Native AOT MCP server for .NET 10.</Description>

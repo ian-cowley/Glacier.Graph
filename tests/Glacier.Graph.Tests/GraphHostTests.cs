@@ -213,5 +213,27 @@ namespace Glacier.Graph.Tests
                 .GetProperty("code")
                 .GetInt32();
         }
+
+        [Fact]
+        public async Task GraphMcpServer_HandlesProtocolPing_AndRejectsPathTraversalWhenSandboxed()
+        {
+            using var store = new GraphStore();
+            var search = new GraphSearch(store);
+
+            string requests =
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n" +
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"save_graph\",\"arguments\":{\"filePath\":\"../escape.bin\"}}}\n";
+
+            using var reader = new StringReader(requests);
+            using var writer = new StringWriter();
+            var server = new GraphMcpServer(store, search, reader, writer, allowedBaseDirectory: _tempDir);
+            await server.RunAsync();
+
+            var responses = ParseLines(writer.ToString());
+            Assert.Equal(2, responses.Count);
+            Assert.True(responses[0].RootElement.TryGetProperty("result", out _));
+            Assert.Equal(-32000, GetErrorCode(responses[1]));
+            Assert.False(File.Exists(Path.GetFullPath(Path.Combine(_tempDir, "../escape.bin"))));
+        }
     }
 }

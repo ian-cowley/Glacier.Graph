@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 namespace Glacier.Graph.Storage
@@ -99,51 +100,78 @@ namespace Glacier.Graph.Storage
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
 
+            string fullPath = Path.GetFullPath(filePath);
+            string? dir = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+            string tempPath = $"{fullPath}.{Guid.NewGuid():N}.tmp";
+
             EnterReadLock();
             try
             {
-                using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 65536);
-                using var writer = new BinaryWriter(fs);
-
-                int activeNodeSlots = _nodeCount + 1;
-                int activeEdgeSlots = _edgeCount + 1;
-
-                // 1. Header (Magic Bytes + Version + Active Counts + Active Slot Lengths)
-                writer.Write("GLGR");
-                writer.Write(2); // Version 2 includes weights
-                writer.Write(_nodeCount);
-                writer.Write(_edgeCount);
-                writer.Write(activeNodeSlots);
-                writer.Write(activeEdgeSlots);
-
-                // 2. Relation Types Dict
-                writer.Write(_relationTypes.Count);
-                foreach (var kvp in _relationTypes)
+                try
                 {
-                    writer.Write(kvp.Key);
-                    writer.Write(kvp.Value);
-                }
+                    using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536))
+                    using (var writer = new BinaryWriter(fs, Encoding.UTF8, leaveOpen: true))
+                    {
+                        int activeNodeSlots = _nodeCount + 1;
+                        int activeEdgeSlots = _edgeCount + 1;
 
-                // 3. Node ID Mappings
-                writer.Write(_externalToInternalId.Count);
-                foreach (var kvp in _externalToInternalId)
+                        // 1. Header (Magic Bytes + Version + Active Counts + Active Slot Lengths)
+                        writer.Write("GLGR");
+                        writer.Write(2); // Version 2 includes weights
+                        writer.Write(_nodeCount);
+                        writer.Write(_edgeCount);
+                        writer.Write(activeNodeSlots);
+                        writer.Write(activeEdgeSlots);
+
+                        // 2. Relation Types Dict
+                        writer.Write(_relationTypes.Count);
+                        foreach (var kvp in _relationTypes)
+                        {
+                            writer.Write(kvp.Key);
+                            writer.Write(kvp.Value);
+                        }
+
+                        // 3. Node ID Mappings
+                        writer.Write(_externalToInternalId.Count);
+                        foreach (var kvp in _externalToInternalId)
+                        {
+                            writer.Write(kvp.Key);
+                            writer.Write(kvp.Value);
+                        }
+
+                        // 4. String Metadata Array (only active node slots 0.._nodeCount)
+                        for (int i = 0; i < activeNodeSlots; i++)
+                        {
+                            writer.Write(_nodeMetadata[i] ?? string.Empty);
+                        }
+
+                        // 5. Raw Array Byte Dumps (active slices only)
+                        writer.Flush();
+                        fs.Write(MemoryMarshal.AsBytes(_head.AsSpan(0, activeNodeSlots)));
+                        fs.Write(MemoryMarshal.AsBytes(_to.AsSpan(0, activeEdgeSlots)));
+                        fs.Write(MemoryMarshal.AsBytes(_relation.AsSpan(0, activeEdgeSlots)));
+                        fs.Write(MemoryMarshal.AsBytes(_next.AsSpan(0, activeEdgeSlots)));
+                        fs.Write(MemoryMarshal.AsBytes(_weights.AsSpan(0, activeEdgeSlots)));
+                        fs.Flush(flushToDisk: true);
+                    }
+
+                    File.Move(tempPath, fullPath, overwrite: true);
+                }
+                catch
                 {
-                    writer.Write(kvp.Key);
-                    writer.Write(kvp.Value);
+                    try
+                    {
+                        if (File.Exists(tempPath)) File.Delete(tempPath);
+                    }
+                    catch
+                    {
+                    }
+                    throw;
                 }
-
-                // 4. String Metadata Array (only active node slots 0.._nodeCount)
-                for (int i = 0; i < activeNodeSlots; i++)
-                {
-                    writer.Write(_nodeMetadata[i] ?? string.Empty);
-                }
-
-                // 5. Raw Array Byte Dumps (active slices only)
-                fs.Write(MemoryMarshal.AsBytes(_head.AsSpan(0, activeNodeSlots)));
-                fs.Write(MemoryMarshal.AsBytes(_to.AsSpan(0, activeEdgeSlots)));
-                fs.Write(MemoryMarshal.AsBytes(_relation.AsSpan(0, activeEdgeSlots)));
-                fs.Write(MemoryMarshal.AsBytes(_next.AsSpan(0, activeEdgeSlots)));
-                fs.Write(MemoryMarshal.AsBytes(_weights.AsSpan(0, activeEdgeSlots)));
             }
             finally
             {

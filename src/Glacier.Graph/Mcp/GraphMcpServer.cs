@@ -4,6 +4,7 @@ using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Graph.Storage;
 using Glacier.Graph.Traversal;
@@ -16,7 +17,7 @@ namespace Glacier.Graph.Mcp
     /// </summary>
     public class GraphMcpServer
     {
-        private readonly object _stateLock = new();
+        private readonly ReaderWriterLockSlim _stateLock = new(LockRecursionPolicy.NoRecursion);
         private GraphStore _store;
         private GraphSearch _search;
         private bool _ownsCurrentStore;
@@ -24,31 +25,41 @@ namespace Glacier.Graph.Mcp
         private readonly TextReader _reader;
         private readonly TextWriter _writer;
         private readonly bool _debugLoggingEnabled;
+        private readonly string? _allowedBaseDirectory;
 
-        public GraphMcpServer(GraphStore store, GraphSearch search)
+        public GraphMcpServer(GraphStore store, GraphSearch search, string? allowedBaseDirectory = null)
             : this(
                 store,
                 search,
                 new StreamReader(Console.OpenStandardInput(), Encoding.UTF8),
-                CreateStdOutWriter())
+                CreateStdOutWriter(),
+                allowedBaseDirectory)
         {
         }
 
-        public GraphMcpServer(GraphStore store, GraphSearch search, Stream input, Stream output)
+        public GraphMcpServer(GraphStore store, GraphSearch search, Stream input, Stream output, string? allowedBaseDirectory = null)
             : this(
                 store,
                 search,
                 new StreamReader(input ?? throw new ArgumentNullException(nameof(input)), Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true),
-                CreateUtf8NoBomWriter(output ?? throw new ArgumentNullException(nameof(output))))
+                CreateUtf8NoBomWriter(output ?? throw new ArgumentNullException(nameof(output))),
+                allowedBaseDirectory)
         {
         }
 
-        public GraphMcpServer(GraphStore store, GraphSearch search, TextReader reader, TextWriter writer)
+        public GraphMcpServer(GraphStore store, GraphSearch search, TextReader reader, TextWriter writer, string? allowedBaseDirectory = null)
         {
             _store = store ?? throw new ArgumentNullException(nameof(store));
             _search = search ?? throw new ArgumentNullException(nameof(search));
             _reader = reader ?? throw new ArgumentNullException(nameof(reader));
             _writer = writer ?? throw new ArgumentNullException(nameof(writer));
+
+            string? baseDir = !string.IsNullOrWhiteSpace(allowedBaseDirectory)
+                ? allowedBaseDirectory
+                : Environment.GetEnvironmentVariable("GLACIER_GRAPH_DATA_DIR");
+            _allowedBaseDirectory = !string.IsNullOrWhiteSpace(baseDir)
+                ? Path.GetFullPath(baseDir)
+                : null;
 
             string? debugEnv = Environment.GetEnvironmentVariable("GLACIER_GRAPH_MCP_DEBUG");
             _debugLoggingEnabled = string.Equals(debugEnv, "1", StringComparison.OrdinalIgnoreCase)
@@ -133,6 +144,10 @@ namespace Glacier.Graph.Mcp
 
                         case "tools/list":
                             await SendToolsListResponseAsync(requestId, HandleToolsList());
+                            break;
+
+                        case "ping":
+                            await SendPingResponseAsync(requestId);
                             break;
 
                         case "tools/call":
@@ -330,11 +345,16 @@ namespace Glacier.Graph.Mcp
                         ? (m.GetString() ?? string.Empty)
                         : string.Empty;
 
-                    lock (_stateLock)
+                    _stateLock.EnterReadLock();
+                    try
                     {
                         int internalId = _store.AddNode(nodeId, metadata);
                         return CreateToolResponse(
                             $"Successfully added node: '{nodeId}' with metadata: '{metadata}' (Internal ID: {internalId}). Total Nodes: {_store.NodeCount}");
+                    }
+                    finally
+                    {
+                        _stateLock.ExitReadLock();
                     }
                 }
 
@@ -349,11 +369,16 @@ namespace Glacier.Graph.Mcp
                         ? wElem.GetSingle()
                         : 1.0f;
 
-                    lock (_stateLock)
+                    _stateLock.EnterReadLock();
+                    try
                     {
                         _store.AddEdge(source, target, relation, weight);
                         return CreateToolResponse(
                             $"Successfully linked {source} -> {relation} -> {target}. Total Edges: {_store.EdgeCount}");
+                    }
+                    finally
+                    {
+                        _stateLock.ExitReadLock();
                     }
                 }
 
@@ -367,11 +392,16 @@ namespace Glacier.Graph.Mcp
                         && weightedElem.GetBoolean();
 
                     List<string> path;
-                    lock (_stateLock)
+                    _stateLock.EnterReadLock();
+                    try
                     {
                         path = weighted
                             ? _search.FindShortestPathDijkstra(start, target)
                             : _search.FindShortestPath(start, target);
+                    }
+                    finally
+                    {
+                        _stateLock.ExitReadLock();
                     }
 
                     string content = path.Count > 0
@@ -391,9 +421,14 @@ namespace Glacier.Graph.Mcp
 
                     int maxHops = maxHopsElem.GetInt32();
                     List<string> neighbors;
-                    lock (_stateLock)
+                    _stateLock.EnterReadLock();
+                    try
                     {
                         neighbors = _search.FindNeighborhood(source, maxHops);
+                    }
+                    finally
+                    {
+                        _stateLock.ExitReadLock();
                     }
 
                     string content = neighbors.Count > 0
@@ -405,17 +440,23 @@ namespace Glacier.Graph.Mcp
 
                 case "save_graph":
                 {
-                    string filePath = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("filePath", out JsonElement pathElem)
+                    string rawPath = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("filePath", out JsonElement pathElem)
                         ? (pathElem.GetString() ?? "graph_database.bin")
                         : "graph_database.bin";
+                    string filePath = ResolveSafePath(rawPath);
 
                     int nodeCount;
                     int edgeCount;
-                    lock (_stateLock)
+                    _stateLock.EnterReadLock();
+                    try
                     {
                         _store.SaveToDisk(filePath);
                         nodeCount = _store.NodeCount;
                         edgeCount = _store.EdgeCount;
+                    }
+                    finally
+                    {
+                        _stateLock.ExitReadLock();
                     }
 
                     long size = new FileInfo(filePath).Length;
@@ -425,9 +466,10 @@ namespace Glacier.Graph.Mcp
 
                 case "load_graph":
                 {
-                    string filePath = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("filePath", out JsonElement pathElem)
+                    string rawPath = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("filePath", out JsonElement pathElem)
                         ? (pathElem.GetString() ?? "graph_database.bin")
                         : "graph_database.bin";
+                    string filePath = ResolveSafePath(rawPath);
 
                     if (!File.Exists(filePath))
                     {
@@ -440,7 +482,8 @@ namespace Glacier.Graph.Mcp
                     int nodeCount;
                     int edgeCount;
 
-                    lock (_stateLock)
+                    _stateLock.EnterWriteLock();
+                    try
                     {
                         if (_ownsCurrentStore && !ReferenceEquals(_store, revivedStore))
                         {
@@ -453,6 +496,10 @@ namespace Glacier.Graph.Mcp
                         nodeCount = _store.NodeCount;
                         edgeCount = _store.EdgeCount;
                     }
+                    finally
+                    {
+                        _stateLock.ExitWriteLock();
+                    }
 
                     previousOwnedStore?.Dispose();
 
@@ -463,6 +510,43 @@ namespace Glacier.Graph.Mcp
                 default:
                     throw new NotSupportedException($"Tool '{name}' is not supported.");
             }
+        }
+
+        private string ResolveSafePath(string requestedPath)
+        {
+            if (string.IsNullOrWhiteSpace(requestedPath) || requestedPath.IndexOf('\0') >= 0)
+            {
+                throw new ArgumentException("Invalid graph file path.");
+            }
+
+            string normalized = requestedPath.Replace('\\', '/');
+            foreach (string segment in normalized.Split('/', StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (segment == "..")
+                {
+                    throw new UnauthorizedAccessException($"Path traversal segments ('..') are not allowed in graph path '{requestedPath}'.");
+                }
+            }
+
+            if (_allowedBaseDirectory == null)
+            {
+                return requestedPath;
+            }
+
+            string combined = Path.IsPathRooted(requestedPath)
+                ? Path.GetFullPath(requestedPath)
+                : Path.GetFullPath(Path.Combine(_allowedBaseDirectory, requestedPath));
+
+            string basePrefix = _allowedBaseDirectory.EndsWith(Path.DirectorySeparatorChar)
+                ? _allowedBaseDirectory
+                : _allowedBaseDirectory + Path.DirectorySeparatorChar;
+            var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            if (!combined.StartsWith(basePrefix, comparison))
+            {
+                throw new UnauthorizedAccessException($"Graph path '{requestedPath}' resolves outside allowed directory.");
+            }
+
+            return combined;
         }
 
         private static string GetRequiredString(JsonElement args, string propertyName)
@@ -535,9 +619,32 @@ namespace Glacier.Graph.Mcp
             Log($"Sending error: {json}");
             await _writer.WriteLineAsync(json);
         }
+
+        private async Task SendPingResponseAsync(JsonElement? id)
+        {
+            var envelope = new McpPingResponse
+            {
+                Id = id,
+                Result = new McpEmptyResult()
+            };
+            string json = JsonSerializer.Serialize(envelope, GraphMcpJsonContext.Default.McpPingResponse);
+            Log($"Sending ping response: {json}");
+            await _writer.WriteLineAsync(json);
+        }
     }
 
     // --- Native AOT Typed MCP DTOs ---
+
+    public sealed class McpPingResponse
+    {
+        public string Jsonrpc { get; init; } = "2.0";
+        public JsonElement? Id { get; init; }
+        public required McpEmptyResult Result { get; init; }
+    }
+
+    public sealed class McpEmptyResult
+    {
+    }
 
     public sealed class McpInitializeResponse
     {
@@ -641,6 +748,8 @@ namespace Glacier.Graph.Mcp
     [JsonSerializable(typeof(McpToolsListResponse))]
     [JsonSerializable(typeof(McpToolCallResponse))]
     [JsonSerializable(typeof(McpErrorResponse))]
+    [JsonSerializable(typeof(McpPingResponse))]
+    [JsonSerializable(typeof(McpEmptyResult))]
     public partial class GraphMcpJsonContext : JsonSerializerContext
     {
     }
