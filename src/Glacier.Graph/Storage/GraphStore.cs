@@ -219,70 +219,149 @@ namespace Glacier.Graph.Storage
                 int initialEdgeCap = Math.Max(16, edgeCap > 0 ? edgeCap - 1 : 0);
 
                 var store = new GraphStore(initialNodeCap, initialEdgeCap);
-                store._nodeCount = nodeCount;
-                store._edgeCount = edgeCount;
+                try
+                {
+                    store._nodeCount = nodeCount;
+                    store._edgeCount = edgeCount;
 
-                // 2. Relation Types
-                int relCount = reader.ReadInt32();
-                if (relCount < 0)
+                    // 2. Relation Types
+                    int relCount = reader.ReadInt32();
+                    if (relCount < 0)
+                    {
+                        throw new InvalidDataException("Corrupt Glacier Graph relation table count.");
+                    }
+
+                    for (int i = 0; i < relCount; i++)
+                    {
+                        string rName = reader.ReadString();
+                        int rId = reader.ReadInt32();
+                        store._relationTypes[rName] = rId;
+                        store._relationTypeNames[rId] = rName;
+                    }
+
+                    // 3. Node ID Mappings
+                    int idCount = reader.ReadInt32();
+                    if (idCount < 0 || idCount > nodeCount)
+                    {
+                        throw new InvalidDataException(
+                            $"Corrupt Glacier Graph node mapping count: {idCount} for NodeCount={nodeCount}.");
+                    }
+
+                    for (int i = 0; i < idCount; i++)
+                    {
+                        string key = reader.ReadString();
+                        int val = reader.ReadInt32();
+                        if (val < 1 || val > nodeCount)
+                        {
+                            throw new InvalidDataException(
+                                $"Corrupt Glacier Graph node ID mapping: internal ID {val} is out of bounds [1..{nodeCount}].");
+                        }
+
+                        if (!store._externalToInternalId.TryAdd(key, val)
+                            || !store._internalToExternalId.TryAdd(val, key))
+                        {
+                            throw new InvalidDataException(
+                                $"Corrupt Glacier Graph duplicate node ID mapping for '{key}' -> {val}.");
+                        }
+                    }
+
+                    // 4. String Metadata Array
+                    for (int i = 0; i < nodeCap; i++)
+                    {
+                        store._nodeMetadata[i] = reader.ReadString();
+                    }
+
+                    // 5. Raw Array Byte Loads
+                    if (nodeCap > 0)
+                    {
+                        fs.ReadExactly(MemoryMarshal.AsBytes(store._head.AsSpan(0, nodeCap)));
+                    }
+
+                    if (edgeCap > 0)
+                    {
+                        fs.ReadExactly(MemoryMarshal.AsBytes(store._to.AsSpan(0, edgeCap)));
+                        fs.ReadExactly(MemoryMarshal.AsBytes(store._relation.AsSpan(0, edgeCap)));
+                        fs.ReadExactly(MemoryMarshal.AsBytes(store._next.AsSpan(0, edgeCap)));
+
+                        if (version >= 2)
+                        {
+                            fs.ReadExactly(MemoryMarshal.AsBytes(store._weights.AsSpan(0, edgeCap)));
+                        }
+                        else
+                        {
+                            Array.Fill(store._weights, 1.0f);
+                        }
+                    }
+
+                    // 6. Validate Forward-Star topology bounds, weights, and _next chain acyclicity
+                    for (int u = 1; u <= nodeCount; u++)
+                    {
+                        int h = store._head[u];
+                        if (h < 0 || h > edgeCount)
+                        {
+                            throw new InvalidDataException(
+                                $"Corrupt Glacier Graph head pointer {h} at node {u} (EdgeCount={edgeCount}).");
+                        }
+                    }
+
+                    for (int e = 1; e <= edgeCount; e++)
+                    {
+                        int target = store._to[e];
+                        if (target < 1 || target > nodeCount)
+                        {
+                            throw new InvalidDataException(
+                                $"Corrupt Glacier Graph edge target {target} at edge {e} (NodeCount={nodeCount}).");
+                        }
+
+                        int nextEdge = store._next[e];
+                        if (nextEdge < 0 || nextEdge > edgeCount)
+                        {
+                            throw new InvalidDataException(
+                                $"Corrupt Glacier Graph next-edge pointer {nextEdge} at edge {e} (EdgeCount={edgeCount}).");
+                        }
+
+                        float w = store._weights[e];
+                        if (float.IsNaN(w) || float.IsInfinity(w) || w < 0f)
+                        {
+                            throw new InvalidDataException(
+                                $"Corrupt Glacier Graph edge weight {w} at edge {e}.");
+                        }
+                    }
+
+                    if (edgeCount > 0)
+                    {
+                        bool[] visitedEdges = System.Buffers.ArrayPool<bool>.Shared.Rent(edgeCount + 1);
+                        try
+                        {
+                            visitedEdges.AsSpan(0, edgeCount + 1).Clear();
+                            for (int u = 1; u <= nodeCount; u++)
+                            {
+                                int e = store._head[u];
+                                while (e != 0)
+                                {
+                                    if (visitedEdges[e])
+                                    {
+                                        throw new InvalidDataException(
+                                            $"Corrupt Glacier Graph: cycle or shared edge link detected at edge {e}.");
+                                    }
+                                    visitedEdges[e] = true;
+                                    e = store._next[e];
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            System.Buffers.ArrayPool<bool>.Shared.Return(visitedEdges);
+                        }
+                    }
+
+                    return store;
+                }
+                catch
                 {
                     store.Dispose();
-                    throw new InvalidDataException("Corrupt Glacier Graph relation table count.");
+                    throw;
                 }
-
-                for (int i = 0; i < relCount; i++)
-                {
-                    string rName = reader.ReadString();
-                    int rId = reader.ReadInt32();
-                    store._relationTypes[rName] = rId;
-                    store._relationTypeNames[rId] = rName;
-                }
-
-                // 3. Node ID Mappings
-                int idCount = reader.ReadInt32();
-                if (idCount < 0)
-                {
-                    store.Dispose();
-                    throw new InvalidDataException("Corrupt Glacier Graph node mapping count.");
-                }
-
-                for (int i = 0; i < idCount; i++)
-                {
-                    string key = reader.ReadString();
-                    int val = reader.ReadInt32();
-                    store._externalToInternalId[key] = val;
-                    store._internalToExternalId[val] = key;
-                }
-
-                // 4. String Metadata Array
-                for (int i = 0; i < nodeCap; i++)
-                {
-                    store._nodeMetadata[i] = reader.ReadString();
-                }
-
-                // 5. Raw Array Byte Loads
-                if (nodeCap > 0)
-                {
-                    fs.ReadExactly(MemoryMarshal.AsBytes(store._head.AsSpan(0, nodeCap)));
-                }
-
-                if (edgeCap > 0)
-                {
-                    fs.ReadExactly(MemoryMarshal.AsBytes(store._to.AsSpan(0, edgeCap)));
-                    fs.ReadExactly(MemoryMarshal.AsBytes(store._relation.AsSpan(0, edgeCap)));
-                    fs.ReadExactly(MemoryMarshal.AsBytes(store._next.AsSpan(0, edgeCap)));
-
-                    if (version >= 2)
-                    {
-                        fs.ReadExactly(MemoryMarshal.AsBytes(store._weights.AsSpan(0, edgeCap)));
-                    }
-                    else
-                    {
-                        Array.Fill(store._weights, 1.0f);
-                    }
-                }
-
-                return store;
             }
             catch (EndOfStreamException ex)
             {

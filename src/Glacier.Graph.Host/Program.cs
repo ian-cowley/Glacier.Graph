@@ -14,20 +14,47 @@ namespace Glacier.Graph.Host
             await RunAsync(args);
         }
 
-        internal static async Task RunAsync(string[] args, TextReader? reader = null, TextWriter? writer = null)
+        internal static async Task RunAsync(string[] args, TextReader? reader = null, TextWriter? writer = null, string? allowedBaseDirectory = null)
         {
-            string dbPath = ResolveDbPath(args);
+            string resolvedArgPath = ResolveDbPath(args);
+            string baseDir = !string.IsNullOrWhiteSpace(allowedBaseDirectory)
+                ? Path.GetFullPath(allowedBaseDirectory)
+                : ResolveAllowedBaseDirectory(args, resolvedArgPath);
+
+            bool hasExplicitDbArg = args != null && args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]);
+            string dbPath = (!hasExplicitDbArg && !Path.IsPathRooted(resolvedArgPath))
+                ? Path.Combine(baseDir, resolvedArgPath)
+                : resolvedArgPath;
+
             using GraphStore store = InitializeStore(dbPath);
             var search = new GraphSearch(store);
-            var server = reader != null && writer != null
-                ? new GraphMcpServer(store, search, reader, writer)
-                : new GraphMcpServer(store, search);
+            using var server = reader != null && writer != null
+                ? new GraphMcpServer(store, search, reader, writer, baseDir)
+                : new GraphMcpServer(store, search, baseDir);
 
             Console.Error.WriteLine("Glacier.Graph MCP Server started.");
             Console.Error.WriteLine($"Database Path: {Path.GetFullPath(dbPath)}");
+            Console.Error.WriteLine($"Allowed Data Directory: {baseDir}");
             Console.Error.WriteLine("Listening for JSON-RPC on stdin...");
 
             await server.RunAsync();
+        }
+
+        internal static string ResolveAllowedBaseDirectory(string[]? args, string? dbPath = null)
+        {
+            string? envDir = Environment.GetEnvironmentVariable("GLACIER_GRAPH_DATA_DIR");
+            if (!string.IsNullOrWhiteSpace(envDir))
+            {
+                return Path.GetFullPath(envDir);
+            }
+
+            if (args != null && args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
+            {
+                string fullDbPath = Path.GetFullPath(dbPath ?? args[0]);
+                return Path.GetDirectoryName(fullDbPath) ?? GraphMcpServer.ResolveDefaultBaseDirectory();
+            }
+
+            return GraphMcpServer.ResolveDefaultBaseDirectory();
         }
 
         internal static string ResolveDbPath(string[] args)

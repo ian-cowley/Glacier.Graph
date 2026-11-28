@@ -23,13 +23,15 @@ namespace Glacier.Graph.Storage
 
         public int NodeCount { get; private set; }
         public int EdgeCount { get; private set; }
+        public bool IsSorted { get; private set; }
+        internal bool HasEdgeWeights => _edgeWeightsStart >= 0;
 
         private readonly FileStream _fs;
         private readonly long _fileLength;
         private MemoryMappedFile? _mmf;
         private MemoryMappedViewAccessor? _accessor;
         private byte* _basePointer;
-        private bool _disposed;
+        private volatile bool _disposed;
 
         internal readonly long _rowOffsetsStart;
         internal readonly long _columnIndicesStart;
@@ -67,7 +69,7 @@ namespace Glacier.Graph.Storage
                     }
 
                     version = reader.ReadInt32();
-                    if (version < 1 || version > 2)
+                    if (version < 1 || version > CsrGraphCompiler.CurrentVersion)
                     {
                         throw new InvalidDataException($"Unsupported CSR Graph format version: {version}.");
                     }
@@ -77,6 +79,16 @@ namespace Glacier.Graph.Storage
                     if (NodeCount < 0 || EdgeCount < 0)
                     {
                         throw new InvalidDataException("Corrupt CSR Graph header: negative node or edge count.");
+                    }
+
+                    if (version >= 3)
+                    {
+                        int flags = reader.ReadInt32();
+                        IsSorted = (flags & CsrGraphCompiler.FlagNeighborsSorted) != 0;
+                    }
+                    else
+                    {
+                        IsSorted = false;
                     }
 
                     // Read Relation Types
@@ -96,17 +108,27 @@ namespace Glacier.Graph.Storage
 
                     // Read Node ID Mappings
                     int idCount = reader.ReadInt32();
-                    if (idCount < 0)
+                    if (idCount < 0 || idCount > NodeCount)
                     {
-                        throw new InvalidDataException("Corrupt CSR Graph header: negative node ID count.");
+                        throw new InvalidDataException(
+                            $"Corrupt CSR Graph header: node ID count {idCount} is out of bounds for NodeCount={NodeCount}.");
                     }
 
                     for (int i = 0; i < idCount; i++)
                     {
                         string key = reader.ReadString();
                         int val = reader.ReadInt32();
-                        _externalToInternalId[key] = val;
-                        _internalToExternalId[val] = key;
+                        if (val < 1 || val > NodeCount)
+                        {
+                            throw new InvalidDataException(
+                                $"Corrupt CSR Graph header: internal node ID {val} is out of bounds [1..{NodeCount}].");
+                        }
+
+                        if (!_externalToInternalId.TryAdd(key, val) || !_internalToExternalId.TryAdd(val, key))
+                        {
+                            throw new InvalidDataException(
+                                $"Corrupt CSR Graph header: duplicate node ID mapping '{key}' -> {val}.");
+                        }
                     }
 
                     // Read String Metadata (only retain active slots 0..NodeCount)
@@ -287,21 +309,27 @@ namespace Glacier.Graph.Storage
         public int GetExternalToInternalId(string externalId)
         {
             ArgumentNullException.ThrowIfNull(externalId);
+            ObjectDisposedException.ThrowIf(_disposed, this);
             return _externalToInternalId.TryGetValue(externalId, out int val) ? val : 0;
         }
 
         public bool TryGetInternalId(string externalId, out int internalId)
         {
             ArgumentNullException.ThrowIfNull(externalId);
+            ObjectDisposedException.ThrowIf(_disposed, this);
             return _externalToInternalId.TryGetValue(externalId, out internalId);
         }
 
         public string GetExternalId(int internalId)
-            => _internalToExternalId.TryGetValue(internalId, out string? val) && val != null ? val : string.Empty;
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _internalToExternalId.TryGetValue(internalId, out string? val) && val != null ? val : string.Empty;
+        }
 
         public string GetNodeMetadata(string externalId)
         {
             ArgumentNullException.ThrowIfNull(externalId);
+            ObjectDisposedException.ThrowIf(_disposed, this);
             return _externalToInternalId.TryGetValue(externalId, out int id)
                 ? GetNodeMetadataByInternalId(id)
                 : string.Empty;
@@ -309,6 +337,7 @@ namespace Glacier.Graph.Storage
 
         public string GetNodeMetadataByInternalId(int internalId)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (internalId <= 0 || internalId > NodeCount || internalId >= _nodeMetadata.Length)
             {
                 return string.Empty;
@@ -317,11 +346,15 @@ namespace Glacier.Graph.Storage
         }
 
         public string GetRelationType(int relationId)
-            => _relationTypeNames.TryGetValue(relationId, out string? name) && name != null ? name : string.Empty;
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _relationTypeNames.TryGetValue(relationId, out string? name) && name != null ? name : string.Empty;
+        }
 
         public int GetRelationId(string relationType)
         {
             ArgumentNullException.ThrowIfNull(relationType);
+            ObjectDisposedException.ThrowIf(_disposed, this);
             return _relationTypes.TryGetValue(relationType, out int id) ? id : 0;
         }
 
@@ -491,22 +524,59 @@ namespace Glacier.Graph.Storage
 
             if (TryGetNeighbors(nodeA, out var neighborsA) && TryGetNeighbors(nodeB, out var neighborsB))
             {
-                return Kernels.CsrKernels.CountCommonNeighbors(neighborsA, neighborsB, isSorted);
+                return Kernels.CsrKernels.CountCommonNeighbors(neighborsA, neighborsB, IsSorted);
+            }
+
+            if (IsSorted)
+            {
+                int sortedCount = 0;
+                var edgesA = GetOutwardEdgesByInternalId(nodeA);
+                var edgesB = GetOutwardEdgesByInternalId(nodeB);
+                bool hasA = edgesA.MoveNext();
+                bool hasB = edgesB.MoveNext();
+
+                while (hasA && hasB)
+                {
+                    int valA = edgesA.CurrentTargetNodeId;
+                    int valB = edgesB.CurrentTargetNodeId;
+
+                    if (valA == valB)
+                    {
+                        sortedCount++;
+                        edgesA.Advance();
+                        edgesB.Advance();
+                        hasA = edgesA.MoveNext();
+                        hasB = edgesB.MoveNext();
+                    }
+                    else if (valA < valB)
+                    {
+                        edgesA.Advance();
+                        hasA = edgesA.MoveNext();
+                    }
+                    else
+                    {
+                        edgesB.Advance();
+                        hasB = edgesB.MoveNext();
+                    }
+                }
+
+                return sortedCount;
             }
 
             int count = 0;
-            var edgesA = GetOutwardEdgesByInternalId(nodeA);
-            while (edgesA.MoveNext())
+            var edgesUnsortedA = GetOutwardEdgesByInternalId(nodeA);
+            while (edgesUnsortedA.MoveNext())
             {
-                int neighbor = edgesA.CurrentTargetNodeId;
+                int neighbor = edgesUnsortedA.CurrentTargetNodeId;
                 if (ContainsNeighbor(nodeB, neighbor)) count++;
-                edgesA.Advance();
+                edgesUnsortedA.Advance();
             }
             return count;
         }
 
         public CsrEdgeEnumerator GetOutwardEdges(string externalId)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             int internalId = GetExternalToInternalId(externalId);
             return GetOutwardEdgesByInternalId(internalId);
         }
@@ -541,14 +611,17 @@ namespace Glacier.Graph.Storage
             if (_disposed) return;
             _disposed = true;
 
-            if (_basePointer != null)
+            lock (_lock)
             {
-                _accessor?.SafeMemoryMappedViewHandle.ReleasePointer();
-                _basePointer = null;
+                if (_basePointer != null)
+                {
+                    _accessor?.SafeMemoryMappedViewHandle.ReleasePointer();
+                    _basePointer = null;
+                }
+                _accessor?.Dispose();
+                _mmf?.Dispose();
+                _fs?.Dispose();
             }
-            _accessor?.Dispose();
-            _mmf?.Dispose();
-            _fs?.Dispose();
             GC.SuppressFinalize(this);
         }
 
@@ -564,6 +637,9 @@ namespace Glacier.Graph.Storage
 
             public CsrEdgeEnumerator(CsrGraphStore store, int startIndex, int endIndex)
             {
+                ArgumentNullException.ThrowIfNull(store);
+                ObjectDisposedException.ThrowIf(store._disposed, store);
+
                 _store = store;
                 _currentIndex = startIndex;
                 _endIndex = endIndex;
@@ -585,24 +661,55 @@ namespace Glacier.Graph.Storage
                 }
             }
 
-            public bool MoveNext() => _store != null && _currentIndex < _endIndex;
+            public bool MoveNext()
+            {
+                if (_store == null) return false;
+                ObjectDisposedException.ThrowIf(_store._disposed, _store);
+                return _currentIndex < _endIndex;
+            }
 
-            public int CurrentTargetNodeId => _pColumns != null
-                ? _pColumns[_currentIndex]
-                : _store!.ReadInt32(_store._columnIndicesStart + (long)_currentIndex * sizeof(int));
+            public int CurrentTargetNodeId
+            {
+                get
+                {
+                    if (_store == null) throw new InvalidOperationException("Enumerator is uninitialized.");
+                    ObjectDisposedException.ThrowIf(_store._disposed, _store);
+                    return _pColumns != null
+                        ? _pColumns[_currentIndex]
+                        : _store.ReadInt32(_store._columnIndicesStart + (long)_currentIndex * sizeof(int));
+                }
+            }
 
-            public int CurrentRelationId => _pRelations != null
-                ? _pRelations[_currentIndex]
-                : _store!.ReadInt32(_store._edgeRelationsStart + (long)_currentIndex * sizeof(int));
+            public int CurrentRelationId
+            {
+                get
+                {
+                    if (_store == null) throw new InvalidOperationException("Enumerator is uninitialized.");
+                    ObjectDisposedException.ThrowIf(_store._disposed, _store);
+                    return _pRelations != null
+                        ? _pRelations[_currentIndex]
+                        : _store.ReadInt32(_store._edgeRelationsStart + (long)_currentIndex * sizeof(int));
+                }
+            }
 
-            public float CurrentWeight => !_hasWeights
-                ? 1.0f
-                : (_pWeights != null
-                    ? _pWeights[_currentIndex]
-                    : _store!.ReadSingle(_store._edgeWeightsStart + (long)_currentIndex * sizeof(float)));
+            public float CurrentWeight
+            {
+                get
+                {
+                    if (_store == null) throw new InvalidOperationException("Enumerator is uninitialized.");
+                    ObjectDisposedException.ThrowIf(_store._disposed, _store);
+                    return !_hasWeights
+                        ? 1.0f
+                        : (_pWeights != null
+                            ? _pWeights[_currentIndex]
+                            : _store.ReadSingle(_store._edgeWeightsStart + (long)_currentIndex * sizeof(float)));
+                }
+            }
 
             public void Advance()
             {
+                if (_store == null) return;
+                ObjectDisposedException.ThrowIf(_store._disposed, _store);
                 _currentIndex++;
             }
         }

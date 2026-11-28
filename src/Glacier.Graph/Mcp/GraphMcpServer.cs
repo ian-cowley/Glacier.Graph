@@ -15,8 +15,10 @@ namespace Glacier.Graph.Mcp
     /// A zero-dependency, Native AOT-compatible Model Context Protocol (MCP) server over Stdio.
     /// Exposes the high-performance Glacier.Graph engine to AI agents using source-generated JSON serialization.
     /// </summary>
-    public class GraphMcpServer
+    public class GraphMcpServer : IDisposable
     {
+        private static readonly string ServerVersion = ResolveServerVersion();
+
         private readonly ReaderWriterLockSlim _stateLock = new(LockRecursionPolicy.NoRecursion);
         private GraphStore _store;
         private GraphSearch _search;
@@ -24,16 +26,32 @@ namespace Glacier.Graph.Mcp
 
         private readonly TextReader _reader;
         private readonly TextWriter _writer;
+        private readonly bool _ownsIo;
         private readonly bool _debugLoggingEnabled;
-        private readonly string? _allowedBaseDirectory;
+        private readonly string _allowedBaseDirectory;
+        private volatile bool _disposed;
+
+        internal string AllowedBaseDirectory => _allowedBaseDirectory;
+
+        public static string ResolveDefaultBaseDirectory()
+        {
+            return Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "graph_data"));
+        }
+
+        private static string ResolveServerVersion()
+        {
+            Version? v = typeof(GraphMcpServer).Assembly.GetName().Version;
+            return v != null ? $"{v.Major}.{v.Minor}.{Math.Max(0, v.Build)}" : "1.2.1";
+        }
 
         public GraphMcpServer(GraphStore store, GraphSearch search, string? allowedBaseDirectory = null)
             : this(
                 store,
                 search,
-                new StreamReader(Console.OpenStandardInput(), Encoding.UTF8),
+                new StreamReader(Console.OpenStandardInput(), Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true),
                 CreateStdOutWriter(),
-                allowedBaseDirectory)
+                allowedBaseDirectory,
+                ownsIo: true)
         {
         }
 
@@ -43,23 +61,36 @@ namespace Glacier.Graph.Mcp
                 search,
                 new StreamReader(input ?? throw new ArgumentNullException(nameof(input)), Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true),
                 CreateUtf8NoBomWriter(output ?? throw new ArgumentNullException(nameof(output))),
-                allowedBaseDirectory)
+                allowedBaseDirectory,
+                ownsIo: true)
         {
         }
 
         public GraphMcpServer(GraphStore store, GraphSearch search, TextReader reader, TextWriter writer, string? allowedBaseDirectory = null)
+            : this(store, search, reader, writer, allowedBaseDirectory, ownsIo: false)
+        {
+        }
+
+        private GraphMcpServer(
+            GraphStore store,
+            GraphSearch search,
+            TextReader reader,
+            TextWriter writer,
+            string? allowedBaseDirectory,
+            bool ownsIo)
         {
             _store = store ?? throw new ArgumentNullException(nameof(store));
             _search = search ?? throw new ArgumentNullException(nameof(search));
             _reader = reader ?? throw new ArgumentNullException(nameof(reader));
             _writer = writer ?? throw new ArgumentNullException(nameof(writer));
+            _ownsIo = ownsIo;
 
             string? baseDir = !string.IsNullOrWhiteSpace(allowedBaseDirectory)
                 ? allowedBaseDirectory
                 : Environment.GetEnvironmentVariable("GLACIER_GRAPH_DATA_DIR");
             _allowedBaseDirectory = !string.IsNullOrWhiteSpace(baseDir)
                 ? Path.GetFullPath(baseDir)
-                : null;
+                : ResolveDefaultBaseDirectory();
 
             string? debugEnv = Environment.GetEnvironmentVariable("GLACIER_GRAPH_MCP_DEBUG");
             _debugLoggingEnabled = string.Equals(debugEnv, "1", StringComparison.OrdinalIgnoreCase)
@@ -99,8 +130,11 @@ namespace Glacier.Graph.Mcp
 
         public async Task RunAsync()
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
             while (await _reader.ReadLineAsync() is { } line)
             {
+                ObjectDisposedException.ThrowIf(_disposed, this);
                 if (string.IsNullOrWhiteSpace(line)) continue;
 
                 JsonElement? requestId = null;
@@ -163,10 +197,14 @@ namespace Glacier.Graph.Mcp
                                     await SendErrorAsync(requestId, -32602, "Missing parameters for tools/call");
                                 }
                             }
+                            catch (ObjectDisposedException)
+                            {
+                                throw;
+                            }
                             catch (Exception toolEx)
                             {
                                 Log($"Tool execution error: {toolEx.Message}");
-                                await SendErrorAsync(requestId, -32000, toolEx.Message);
+                                await SendToolCallResponseAsync(requestId, CreateToolResponse(toolEx.Message, isError: true));
                             }
                             break;
 
@@ -207,7 +245,7 @@ namespace Glacier.Graph.Mcp
                 ServerInfo = new McpServerInfo
                 {
                     Name = "Glacier.Graph",
-                    Version = "1.1.0"
+                    Version = ServerVersion
                 }
             };
         }
@@ -323,6 +361,8 @@ namespace Glacier.Graph.Mcp
 
         private McpToolCallResult HandleToolCall(JsonElement parameters)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
             if (!parameters.TryGetProperty("name", out JsonElement nameElem))
             {
                 throw new ArgumentException("Missing tool 'name'.");
@@ -528,11 +568,6 @@ namespace Glacier.Graph.Mcp
                 }
             }
 
-            if (_allowedBaseDirectory == null)
-            {
-                return requestedPath;
-            }
-
             string combined = Path.IsPathRooted(requestedPath)
                 ? Path.GetFullPath(requestedPath)
                 : Path.GetFullPath(Path.Combine(_allowedBaseDirectory, requestedPath));
@@ -561,14 +596,15 @@ namespace Glacier.Graph.Mcp
             return prop.GetString() ?? string.Empty;
         }
 
-        private static McpToolCallResult CreateToolResponse(string text)
+        private static McpToolCallResult CreateToolResponse(string text, bool? isError = null)
         {
             return new McpToolCallResult
             {
                 Content =
                 [
                     new McpContentItem { Type = "text", Text = text }
-                ]
+                ],
+                IsError = isError
             };
         }
 
@@ -630,6 +666,50 @@ namespace Glacier.Graph.Mcp
             string json = JsonSerializer.Serialize(envelope, GraphMcpJsonContext.Default.McpPingResponse);
             Log($"Sending ping response: {json}");
             await _writer.WriteLineAsync(json);
+        }
+
+        public void Dispose()
+        {
+            Dispose(disposing: true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (_disposed) return;
+
+            if (disposing)
+            {
+                GraphStore? ownedStore = null;
+                _stateLock.EnterWriteLock();
+                try
+                {
+                    if (_disposed) return;
+                    _disposed = true;
+                    if (_ownsCurrentStore)
+                    {
+                        ownedStore = _store;
+                        _ownsCurrentStore = false;
+                    }
+                }
+                finally
+                {
+                    _stateLock.ExitWriteLock();
+                }
+
+                ownedStore?.Dispose();
+                _stateLock.Dispose();
+
+                if (_ownsIo)
+                {
+                    _reader.Dispose();
+                    _writer.Dispose();
+                }
+            }
+            else
+            {
+                _disposed = true;
+            }
         }
     }
 

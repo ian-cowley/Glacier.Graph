@@ -2,8 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Graph.Mcp;
 using Glacier.Graph.Storage;
@@ -12,6 +14,12 @@ using Xunit;
 
 namespace Glacier.Graph.Tests
 {
+    [CollectionDefinition("McpEnvIsolation", DisableParallelization = true)]
+    public sealed class McpEnvIsolationCollection
+    {
+    }
+
+    [Collection("McpEnvIsolation")]
     public class GraphHostTests : IDisposable
     {
         private readonly string _tempDir;
@@ -126,6 +134,7 @@ namespace Glacier.Graph.Tests
             // 1: initialize
             Assert.Equal("2024-11-05", responses[0].RootElement.GetProperty("result").GetProperty("protocolVersion").GetString());
             Assert.Equal("Glacier.Graph", responses[0].RootElement.GetProperty("result").GetProperty("serverInfo").GetProperty("name").GetString());
+            Assert.Equal("1.2.1", responses[0].RootElement.GetProperty("result").GetProperty("serverInfo").GetProperty("version").GetString());
 
             // 2: tools/list
             var toolNames = responses[1].RootElement.GetProperty("result").GetProperty("tools")
@@ -183,10 +192,10 @@ namespace Glacier.Graph.Tests
             Assert.Equal(-32600, GetErrorCode(responses[1])); // Missing method
             Assert.Equal(-32601, GetErrorCode(responses[2])); // Method not found
             Assert.Equal(-32602, GetErrorCode(responses[3])); // Missing params for tools/call
-            Assert.Equal(-32000, GetErrorCode(responses[4])); // Unsupported tool
-            Assert.Equal(-32000, GetErrorCode(responses[5])); // Missing required id
-            Assert.Equal(-32000, GetErrorCode(responses[6])); // Missing required maxHops
-            Assert.Equal(-32000, GetErrorCode(responses[7])); // Missing graph file
+            AssertToolError(responses[4]); // Unsupported tool
+            AssertToolError(responses[5]); // Missing required id
+            AssertToolError(responses[6]); // Missing required maxHops
+            AssertToolError(responses[7]); // Missing/outside-sandbox graph file
         }
 
         private static List<JsonDocument> ParseLines(string output)
@@ -214,6 +223,19 @@ namespace Glacier.Graph.Tests
                 .GetInt32();
         }
 
+        private static void AssertToolError(JsonDocument doc, string? expectedMessageSubstring = null)
+        {
+            Assert.False(doc.RootElement.TryGetProperty("error", out _), "Tool error must use MCP result.isError=true, not JSON-RPC error.");
+            JsonElement result = doc.RootElement.GetProperty("result");
+            Assert.True(result.GetProperty("isError").GetBoolean());
+            string text = result.GetProperty("content")[0].GetProperty("text").GetString() ?? string.Empty;
+            Assert.False(string.IsNullOrWhiteSpace(text));
+            if (expectedMessageSubstring != null)
+            {
+                Assert.Contains(expectedMessageSubstring, text, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
         [Fact]
         public async Task GraphMcpServer_HandlesProtocolPing_AndRejectsPathTraversalWhenSandboxed()
         {
@@ -226,14 +248,192 @@ namespace Glacier.Graph.Tests
 
             using var reader = new StringReader(requests);
             using var writer = new StringWriter();
-            var server = new GraphMcpServer(store, search, reader, writer, allowedBaseDirectory: _tempDir);
+            using var server = new GraphMcpServer(store, search, reader, writer, allowedBaseDirectory: _tempDir);
             await server.RunAsync();
 
             var responses = ParseLines(writer.ToString());
             Assert.Equal(2, responses.Count);
             Assert.True(responses[0].RootElement.TryGetProperty("result", out _));
-            Assert.Equal(-32000, GetErrorCode(responses[1]));
+            AssertToolError(responses[1]);
             Assert.False(File.Exists(Path.GetFullPath(Path.Combine(_tempDir, "../escape.bin"))));
+        }
+
+        [Fact]
+        public async Task GraphMcpServer_Dispose_DisposesOwnedLoadedStoreAndStateLock_AndThrowsAfterDispose()
+        {
+            // 1. Unowned initial store remains usable after server.Dispose() when load_graph was never called
+            using var unownedStore = new GraphStore();
+            unownedStore.AddNode("KeepAlive");
+            using (var server1 = new GraphMcpServer(unownedStore, new GraphSearch(unownedStore), TextReader.Null, TextWriter.Null, allowedBaseDirectory: _tempDir))
+            {
+                await server1.RunAsync();
+            }
+            Assert.Equal(1, unownedStore.NodeCount);
+
+            // 2. When load_graph replaces _store, server.Dispose() disposes the loaded store and _stateLock
+            string persistedPath = Path.Combine(_tempDir, "owned_load.bin");
+            using (var seed = new GraphStore())
+            {
+                seed.AddEdge("U1", "U2", "LINKS");
+                seed.SaveToDisk(persistedPath);
+            }
+
+            string escapedPath = JsonEncodedText.Encode(persistedPath).ToString();
+            string loadReq = $"{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"load_graph\",\"arguments\":{{\"filePath\":\"{escapedPath}\"}}}}}}\n";
+
+            using var initialStore = new GraphStore();
+            using var reader = new StringReader(loadReq);
+            using var writer = new StringWriter();
+            var server2 = new GraphMcpServer(initialStore, new GraphSearch(initialStore), reader, writer, allowedBaseDirectory: _tempDir);
+            await server2.RunAsync();
+
+            var storeField = typeof(GraphMcpServer).GetField("_store", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var lockField = typeof(GraphMcpServer).GetField("_stateLock", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var loadedStore = (GraphStore)storeField.GetValue(server2)!;
+            var stateLock = (ReaderWriterLockSlim)lockField.GetValue(server2)!;
+
+            Assert.NotSame(initialStore, loadedStore);
+            Assert.Equal(2, loadedStore.NodeCount);
+
+            server2.Dispose();
+            server2.Dispose(); // Idempotent double-dispose
+
+            Assert.Throws<ObjectDisposedException>(() => loadedStore.NodeCount);
+            Assert.Throws<ObjectDisposedException>(() => stateLock.EnterReadLock());
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => server2.RunAsync());
+            // Original caller-owned store was not owned after load_graph and stays valid
+            Assert.Equal(0, initialStore.NodeCount);
+        }
+
+        [Fact]
+        public async Task GraphMcpServer_DefaultAllowedBaseDirectory_IsSandboxedNotNull()
+        {
+            string? priorEnv = Environment.GetEnvironmentVariable("GLACIER_GRAPH_DATA_DIR");
+            Environment.SetEnvironmentVariable("GLACIER_GRAPH_DATA_DIR", null);
+            try
+            {
+                using var store = new GraphStore();
+                var search = new GraphSearch(store);
+
+                string outsidePath = Path.Combine(_tempDir, "outside_default.bin");
+                string outsideJson = JsonEncodedText.Encode(outsidePath).ToString();
+                string requests =
+                    $"{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"save_graph\",\"arguments\":{{\"filePath\":\"{outsideJson}\"}}}}}}\n" +
+                    $"{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"load_graph\",\"arguments\":{{\"filePath\":\"{outsideJson}\"}}}}}}\n";
+
+                using var reader = new StringReader(requests);
+                using var writer = new StringWriter();
+                using var server = new GraphMcpServer(store, search, reader, writer);
+
+                Assert.Equal(GraphMcpServer.ResolveDefaultBaseDirectory(), server.AllowedBaseDirectory);
+                Assert.False(string.IsNullOrWhiteSpace(server.AllowedBaseDirectory));
+
+                await server.RunAsync();
+
+                var responses = ParseLines(writer.ToString());
+                Assert.Equal(2, responses.Count);
+                AssertToolError(responses[0], "outside allowed directory");
+                AssertToolError(responses[1], "outside allowed directory");
+                Assert.False(File.Exists(outsidePath));
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("GLACIER_GRAPH_DATA_DIR", priorEnv);
+            }
+        }
+
+        [Fact]
+        public async Task HostRunAsync_DefaultArgs_SandboxesFilesystem_AndHonorsEnvAndDbArg()
+        {
+            string? priorEnv = Environment.GetEnvironmentVariable("GLACIER_GRAPH_DATA_DIR");
+            try
+            {
+                Environment.SetEnvironmentVariable("GLACIER_GRAPH_DATA_DIR", null);
+
+                // 1. Default args -> sandboxed to GraphMcpServer.ResolveDefaultBaseDirectory()
+                Assert.Equal(
+                    GraphMcpServer.ResolveDefaultBaseDirectory(),
+                    Glacier.Graph.Host.Program.ResolveAllowedBaseDirectory(Array.Empty<string>()));
+
+                string outsideEscape = Path.Combine(_tempDir, "host_escape.bin");
+                string outsideJson = JsonEncodedText.Encode(outsideEscape).ToString();
+                string req = $"{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"save_graph\",\"arguments\":{{\"filePath\":\"{outsideJson}\"}}}}}}\n";
+
+                using (var reader = new StringReader(req))
+                using (var writer = new StringWriter())
+                {
+                    await Glacier.Graph.Host.Program.RunAsync(Array.Empty<string>(), reader, writer);
+                    var responses = ParseLines(writer.ToString());
+                    Assert.Single(responses);
+                    AssertToolError(responses[0], "outside allowed directory");
+                    Assert.False(File.Exists(outsideEscape));
+                }
+
+                // 2. Explicit db arg -> sandboxed to db file's directory
+                string explicitDb = Path.Combine(_tempDir, "host_arg.bin");
+                Assert.Equal(_tempDir, Glacier.Graph.Host.Program.ResolveAllowedBaseDirectory(new[] { explicitDb }));
+
+                // 3. GLACIER_GRAPH_DATA_DIR overrides default and db arg
+                string envSubDir = Path.Combine(_tempDir, "env_sandbox");
+                Environment.SetEnvironmentVariable("GLACIER_GRAPH_DATA_DIR", envSubDir);
+                Assert.Equal(Path.GetFullPath(envSubDir), Glacier.Graph.Host.Program.ResolveAllowedBaseDirectory(new[] { explicitDb }));
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("GLACIER_GRAPH_DATA_DIR", priorEnv);
+            }
+        }
+
+        [Fact]
+        public async Task GraphMcpServer_ToolErrors_ReturnIsErrorTrue_WhileProtocolErrorsReturnJsonRpcError()
+        {
+            string corruptBin = Path.Combine(_tempDir, "corrupt_tool.bin");
+            File.WriteAllBytes(corruptBin, new byte[] { 0x01, 0x02, 0x03 });
+
+            string outsidePath = Path.Combine(Path.GetTempPath(), $"outside_{Guid.NewGuid():N}.bin");
+            string outsideJson = JsonEncodedText.Encode(outsidePath).ToString();
+
+            var requests = string.Join("\n", new[]
+            {
+                "{invalid-json",
+                """{"jsonrpc":"2.0","id":1}""",
+                """{"jsonrpc":"2.0","id":2,"method":"unknown/rpc"}""",
+                """{"jsonrpc":"2.0","id":3,"method":"tools/call"}""",
+                """{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"unknown_tool","arguments":{}}}""",
+                """{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"add_node","arguments":{}}}""",
+                """{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"find_neighborhood","arguments":{"sourceId":"A","maxHops":"bad"}}}""",
+                """{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"add_edge","arguments":{"source":"A","target":"B","relation":"R","weight":-1.0}}}""",
+                """{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"load_graph","arguments":{"filePath":"missing_inside_sandbox.bin"}}}""",
+                """{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"load_graph","arguments":{"filePath":"corrupt_tool.bin"}}}""",
+                """{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"save_graph","arguments":{"filePath":"../traversal.bin"}}}""",
+                $"{{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{{\"name\":\"save_graph\",\"arguments\":{{\"filePath\":\"{outsideJson}\"}}}}}}"
+            }) + "\n";
+
+            using var store = new GraphStore();
+            using var reader = new StringReader(requests);
+            using var writer = new StringWriter();
+            using var server = new GraphMcpServer(store, new GraphSearch(store), reader, writer, allowedBaseDirectory: _tempDir);
+            await server.RunAsync();
+
+            var responses = ParseLines(writer.ToString());
+            Assert.Equal(12, responses.Count);
+
+            // Protocol-level errors remain JSON-RPC errors
+            Assert.Equal(-32700, GetErrorCode(responses[0]));
+            Assert.Equal(-32600, GetErrorCode(responses[1]));
+            Assert.Equal(-32601, GetErrorCode(responses[2]));
+            Assert.Equal(-32602, GetErrorCode(responses[3]));
+
+            // Tool-level errors return MCP result.isError == true
+            AssertToolError(responses[4], "not supported");
+            AssertToolError(responses[5], "id");
+            AssertToolError(responses[6]);
+            AssertToolError(responses[7]);
+            AssertToolError(responses[8], "not found");
+            AssertToolError(responses[9]);
+            AssertToolError(responses[10], "traversal");
+            AssertToolError(responses[11], "outside allowed directory");
+            Assert.False(File.Exists(outsidePath));
         }
     }
 }

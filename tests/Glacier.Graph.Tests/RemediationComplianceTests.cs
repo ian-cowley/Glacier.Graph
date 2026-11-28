@@ -364,7 +364,7 @@ public class RemediationComplianceTests : IDisposable
         using var inputStream = new MemoryStream(Encoding.UTF8.GetBytes(requests.ToString()));
         using var outputStream = new MemoryStream();
 
-        var server = new GraphMcpServer(store, search, inputStream, outputStream);
+        using var server = new GraphMcpServer(store, search, inputStream, outputStream, allowedBaseDirectory: _tempDir);
         await server.RunAsync();
 
         string outputText = Encoding.UTF8.GetString(outputStream.ToArray());
@@ -378,7 +378,7 @@ public class RemediationComplianceTests : IDisposable
         {
             Assert.Equal("2.0", initDoc.RootElement.GetProperty("jsonrpc").GetString());
             Assert.Equal(1, initDoc.RootElement.GetProperty("id").GetInt32());
-            Assert.Equal("1.1.0", initDoc.RootElement.GetProperty("result").GetProperty("serverInfo").GetProperty("version").GetString());
+            Assert.Equal("1.2.1", initDoc.RootElement.GetProperty("result").GetProperty("serverInfo").GetProperty("version").GetString());
         }
 
         // Verify tools/list response (id=2)
