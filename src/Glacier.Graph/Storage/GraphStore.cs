@@ -167,8 +167,9 @@ namespace Glacier.Graph.Storage
                     {
                         if (File.Exists(tempPath)) File.Delete(tempPath);
                     }
-                    catch
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                     {
+                        System.Diagnostics.Trace.TraceWarning($"[GraphStore] Failed to delete temp file '{tempPath}': {ex.Message}");
                     }
                     throw;
                 }

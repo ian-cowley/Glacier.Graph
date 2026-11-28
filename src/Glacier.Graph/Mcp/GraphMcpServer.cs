@@ -227,7 +227,11 @@ namespace Glacier.Graph.Mcp
                     Log($"CRITICAL ERROR: {ex.Message}");
                     if (requestId.HasValue && requestId.Value.ValueKind != JsonValueKind.Null)
                     {
-                        try { await SendErrorAsync(requestId, -32603, "Internal server error."); } catch { }
+                        try { await SendErrorAsync(requestId, -32603, "Internal server error."); }
+                        catch (Exception sendEx) when (sendEx is IOException or ObjectDisposedException or InvalidOperationException)
+                        {
+                            Log($"Failed to send error response: {sendEx.Message}");
+                        }
                     }
                 }
             }
